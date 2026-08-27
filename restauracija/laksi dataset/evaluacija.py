@@ -1,4 +1,4 @@
-
+# evaluacija
 from google.colab import drive
 import os
 import zipfile
@@ -14,7 +14,7 @@ import cv2
 from tqdm import tqdm
 from skimage.metrics import structural_similarity as ssim_metric
 
-
+# 1. MONTIRANJE I PUTANJE
 drive.mount('/content/drive')
 
 zip_path = '/content/drive/MyDrive/Projekat_Model/test.zip'
@@ -36,7 +36,9 @@ if not os.path.exists(local_extract_path):
     print("Dataset uspešno otpakovan.")
 
 
-# arhitektura restauracije
+# =====================================================================
+# 2. MODEL RESTAURACIJE (TAČNA TRENING ARHITEKTURA)
+# =====================================================================
 class DepthwiseSeparableConv2d(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, kernel_size: int = 3, padding: int = 1, dilation: int = 1):
         super().__init__()
@@ -495,11 +497,11 @@ def pokreni_evaluaciju():
             'MAE': mae_val
         })
 
-        # cuvanje samostalne slike u originalnoj velicini
+        # Sačuvaj samostalnu restaurisanu sliku u originalnoj veličini
         restored_original_size = restored_pil.resize(dmg_pil.size, Image.Resampling.BILINEAR)
         restored_original_size.save(os.path.join(pojedinacne_dir, f"restored_{dmg_f}"))
 
-        # Uporedni prikaz (Osteceno | Restaurisano | Original)
+        # Uporedni prikaz slika koje su restaurisane
         num_saved_for_type = sum(1 for r in results_list if r['Oštećenje'] == dmg_type)
         if num_saved_for_type <= 10:
             bar_height = 40
