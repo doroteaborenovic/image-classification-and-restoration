@@ -1,4 +1,4 @@
-# evaluacija
+# evaluacija ova je dobra 
 from google.colab import drive
 import os
 import zipfile
