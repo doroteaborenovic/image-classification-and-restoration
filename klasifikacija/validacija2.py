@@ -1,6 +1,8 @@
 # metrike za prvu arhitekturu za klasifikaciju
 # redjanje slika i klasifikacija po ostecenjima (na svaku sliku 6 ostecenja)
 #druga najbolja validacija 
+# metrike za prvu arhitekturu za klasifikaciju
+# redjanje slika i klasifikacija po ostecenjima (na svaku sliku 6 ostecenja)
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -15,11 +17,11 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, precision_score, recall_score, f1_score
 import datetime
+import random
 
 import warnings
 warnings.filterwarnings('ignore')
 
-# --- PRIPREMA DATASETA ---
 drive_test_zip = "/content/drive/MyDrive/Projekat_Model/DATASET_validacija.zip"
 lokalni_test_path = "/content/DATASET_validacija"
 
@@ -35,7 +37,7 @@ else:
     print("Testni skup podataka je već spreman u lokalnom direktorijumu.")
 
 
-# --- ARHITEKTURA MODELA (NEIZMENJENA ZBOG PREUZIMANJA TEŽINA) ---
+#arhitektura
 class RecursiveDenseMicroBlock(nn.Module):
     def __init__(self, channels: int, num_recursions: int = 3):
         super().__init__()
@@ -306,31 +308,34 @@ def evaluiraj_dodinu_mrezu_sa_detaljnim_klasama(
     test_dataset_dir: str,
     img_size: int = 128,
     batch_size: int = 32,
-    koristi_mini_podskup: bool = True
+    koristi_mini_podskup: bool = True,
+    velicina_podskupa: int = 10000
 ):
     nested_path = os.path.join(test_dataset_dir, "DATASET_validacija")
     if os.path.exists(nested_path) and os.path.isdir(nested_path):
         test_dataset_dir = nested_path
-
-    # Detekcija uređaja (CPU/GPU)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"{'='*60}")
     print(f"Uređaj za proračune: {device.type.upper()}")
     print(f"Testni dataset: {test_dataset_dir}")
     print(f"{'='*60}\n")
 
-    # Inicijalizacija dataset-a
     test_dataset = DamageDataset(test_dataset_dir, img_size=img_size, train=False)
 
     if len(test_dataset) == 0:
         print(f"Nema slika na putanji {test_dataset_dir} ili folder ne postoji!")
         return None, None
 
-    # Mini-podskup za brzi rad na CPU
+    # 🔥 SREĐIVANJE PODSKUPA NA OKO 10.000 SLIKA
     if koristi_mini_podskup:
-        indeksi = list(range(0, len(test_dataset), 20))
-        test_dataset = torch.utils.data.Subset(test_dataset, indeksi)
-        print(f"[INFO] Aktiviran mini-podskup za CPU! Testiram model na {len(test_dataset)} slika umesto 5400.")
+        total_dset_len = len(test_dataset)
+        if total_dset_len > velicina_podskupa:
+            # Ravnomerno biramo indekse da zadržimo klasni balans (ako su sortirani po klasama)
+            indeksi = np.linspace(0, total_dset_len - 1, velicina_podskupa, dtype=int).tolist()
+            test_dataset = torch.utils.data.Subset(test_dataset, indeksi)
+            print(f"[INFO] Aktiviran optimizovan podskup! Testiram model na {len(test_dataset)} slika.")
+        else:
+            print(f"[INFO] Dataset ima manje slika ({total_dset_len}) od traženih {velicina_podskupa}. Koristi se ceo skup.")
     else:
         print(f"[INFO] Testiram model na celom skupu podataka ({len(test_dataset)} slika).")
 
@@ -564,6 +569,7 @@ if __name__ == '__main__':
     putanja_do_modela = "/content/drive/MyDrive/Projekat_Model/dodinamrezajej.pth"
     putanja_do_test_dataseta = "/content/DATASET_validacija"
 
+    # 🔥 Sada je uključeno uzorkovanje i cilja tačno 10.000 slika
     KORISTI_MINI_PODSKUP = True
 
     stvarne_oznake, predvidjanja = evaluiraj_dodinu_mrezu_sa_detaljnim_klasama(
@@ -571,5 +577,6 @@ if __name__ == '__main__':
         test_dataset_dir=putanja_do_test_dataseta,
         img_size=128,
         batch_size=32,
-        koristi_mini_podskup=KORISTI_MINI_PODSKUP
+        koristi_mini_podskup=KORISTI_MINI_PODSKUP,
+        velicina_podskupa=10000  # Parametar postavljen na 10k slika
     )
