@@ -38,13 +38,9 @@ def normalna_instalacija(paket):
 
 normalna_instalacija("lpips")
 normalna_instalacija("tabulate")
-normalna_instalacija("matplotlib")
-normalna_instalacija("seaborn")
 
 import lpips
 from tabulate import tabulate
-import matplotlib.pyplot as plt
-import seaborn as sns
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
@@ -67,6 +63,7 @@ EPOCHS_FINETUNE_NJIHOV = 3
 BATCH_SIZE = 4
 LR_NJIHOV = 1e-4
 IMG_SIZE = 256
+NUM_ITERACIJA = 5
 
 def pronadji_foldere(tip="VALIDACIJA"):
     moguce = [
@@ -98,7 +95,7 @@ os.makedirs(DIR_NJIHOV_ROOT, exist_ok=True)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 eval_lpips_fn = lpips.LPIPS(net='alex', verbose=False).to(device).eval()
 
-print(f"\n[INFO] Pokretanje evaluacije na resursu: {device} | Val uzorak: {len(os.listdir(DIR_VAL_DEGRADED))} slika\n")
+print(f"\n[INFO] Pokretanje evaluacije na resursu: {device} | Val uzorak: {len(os.listdir(DIR_VAL_DEGRADED))} slika | Broj iteracija: {NUM_ITERACIJA}\n")
 
 
 # dataset loss arhitektura i to
@@ -188,7 +185,7 @@ if os.path.exists(MS_DRIVE_CKPT):
     if ms_generator is not None:
         ms_state = torch.load(MS_DRIVE_CKPT, map_location=device)
         ms_generator.load_state_dict(ms_state)
-        torch.save(ms_state, ms_ckpt_path)  # Osigurava da skripta run.py koristi ovaj checkpoint
+        torch.save(ms_state, ms_ckpt_path)
         print("✓ Microsoft checkpoint uspešno učitan sa Google Drive-a. Preskače se ponovno treniranje.")
 elif ms_generator is not None and EPOCHS_FINETUNE_NJIHOV > 0:
     print(f"-> Fine-tuning Microsoft modela na {EPOCHS_FINETUNE_NJIHOV} epohe...")
@@ -214,7 +211,6 @@ elif ms_generator is not None and EPOCHS_FINETUNE_NJIHOV > 0:
             total_ep_loss += loss.item()
         print(f"   [Epoha {ep + 1}/{EPOCHS_FINETUNE_NJIHOV}] Loss: {total_ep_loss / len(train_loader):.4f}")
 
-    # Čuvanje lokalno za run.py i trajno na Google Drive
     torch.save(ms_generator.state_dict(), ms_ckpt_path)
     torch.save(ms_generator.state_dict(), MS_DRIVE_CKPT)
     print(f"✓ Fine-tunovani Microsoft model sačuvan na Drive: {MS_DRIVE_CKPT}")
@@ -546,11 +542,9 @@ class Restauracija(nn.Module):
             s3, s3_skip = self.spatial_block3(s2)
             s4, s4_skip = self.spatial_block4(s3)
         else:
-            # Ako se ugasi Spatial grana, skipovi i enkoder preuzimaju spektralni prikaz
             s1_skip, s2_skip, s3_skip, s4_skip = sp1, sp2, sp3, sp4
             s4 = sp4
 
-        # Ako je spektralna ugašena, ona preuzima prostorni prikaz
         if not use_spectral:
             sp1, sp2, sp3, sp4 = s1_skip, s2_skip, s3_skip, s4_skip
 
@@ -630,7 +624,7 @@ moj_model = Restauracija(base_ch=32).to(device)
 model_loaded = False
 priority_ckpts = [
     'Model_Finetuned_Final.pth'
-    ]
+]
 
 for ckpt_name in priority_ckpts:
     ckpt_p = os.path.join(DRIVE_PROJECT_DIR, ckpt_name)
@@ -696,7 +690,13 @@ def format_p_val(p):
     else:
         return f"{p:.4f} (ns)"
 
-results = []
+
+# =============================================================
+# 0. DETERMINISTIČKO RAČUNANJE NA CELOM VALIDACIONOM SETU
+#    (Zasebno za čistu i validnu statistiku bez duplikata)
+# =============================================================
+direct_per_image_stat = []
+
 for fname in val_files:
     clean_p = os.path.join(DIR_VAL_CLEAN, fname)
     moj_p = os.path.join(DIR_MOJ_OUTPUT, fname)
@@ -728,14 +728,39 @@ for fname in val_files:
     ssim_moj = ssim_metric(c_img, m_img, channel_axis=2, data_range=1.0)
     ssim_nj = ssim_metric(c_img, nj_img, channel_axis=2, data_range=1.0)
 
-    results.append({
+    direct_per_image_stat.append({
         'Fname': fname,
         'PSNR_Moj': psnr_moj, 'PSNR_Njihov': psnr_nj,
         'SSIM_Moj': ssim_moj, 'SSIM_Njihov': ssim_nj,
         'LPIPS_Moj': lp_moj, 'LPIPS_Njihov': lp_nj
     })
 
-df = pd.DataFrame(results)
+df_stat_direct = pd.DataFrame(direct_per_image_stat).set_index('Fname')
+
+
+# -------------------------------------------------------------
+# DIREKTNO POREĐENJE SA 5 ITERACIJA (Bootstrap Resampling)
+# -------------------------------------------------------------
+runs_direct_moj_psnr = []
+runs_direct_moj_ssim = []
+runs_direct_moj_lpips = []
+
+runs_direct_nj_psnr = []
+runs_direct_nj_ssim = []
+runs_direct_nj_lpips = []
+
+for it in range(NUM_ITERACIJA):
+    rng = np.random.default_rng(seed=42 + it)
+    boot_files = rng.choice(df_stat_direct.index.values, size=len(df_stat_direct), replace=True)
+    df_boot = df_stat_direct.loc[boot_files]
+
+    runs_direct_moj_psnr.append(df_boot['PSNR_Moj'].mean())
+    runs_direct_moj_ssim.append(df_boot['SSIM_Moj'].mean())
+    runs_direct_moj_lpips.append(df_boot['LPIPS_Moj'].mean())
+
+    runs_direct_nj_psnr.append(df_boot['PSNR_Njihov'].mean())
+    runs_direct_nj_ssim.append(df_boot['SSIM_Njihov'].mean())
+    runs_direct_nj_lpips.append(df_boot['LPIPS_Njihov'].mean())
 
 clean_feats = extract_features(DIR_VAL_CLEAN, val_files)
 moj_feats = extract_features(DIR_MOJ_OUTPUT, val_files)
@@ -744,31 +769,77 @@ nj_feats = extract_features(DIR_NJIHOV_OUTPUT, val_files)
 fid_moj = calculate_fid(clean_feats, moj_feats)
 fid_nj = calculate_fid(clean_feats, nj_feats)
 
-_, p_w_p = stats.wilcoxon(df['PSNR_Moj'], df['PSNR_Njihov'])
-_, p_w_s = stats.wilcoxon(df['SSIM_Moj'], df['SSIM_Njihov'])
-_, p_w_l = stats.wilcoxon(df['LPIPS_Moj'], df['LPIPS_Njihov'])
+# Statistički testovi na 100% nezavisnim podacima (pun skup bez bootstrap duplikata)
+_, p_w_p = stats.wilcoxon(df_stat_direct['PSNR_Moj'], df_stat_direct['PSNR_Njihov'])
+_, p_w_s = stats.wilcoxon(df_stat_direct['SSIM_Moj'], df_stat_direct['SSIM_Njihov'])
+_, p_w_l = stats.wilcoxon(df_stat_direct['LPIPS_Moj'], df_stat_direct['LPIPS_Njihov'])
 
-_, p_t_p = stats.ttest_rel(df['PSNR_Moj'], df['PSNR_Njihov'])
-_, p_t_s = stats.ttest_rel(df['SSIM_Moj'], df['SSIM_Njihov'])
-_, p_t_l = stats.ttest_rel(df['LPIPS_Moj'], df['LPIPS_Njihov'])
+_, p_t_p = stats.ttest_rel(df_stat_direct['PSNR_Moj'], df_stat_direct['PSNR_Njihov'])
+_, p_t_s = stats.ttest_rel(df_stat_direct['SSIM_Moj'], df_stat_direct['SSIM_Njihov'])
+_, p_t_l = stats.ttest_rel(df_stat_direct['LPIPS_Moj'], df_stat_direct['LPIPS_Njihov'])
 
-d_psnr = np.mean(df['PSNR_Moj'] - df['PSNR_Njihov']) / np.std(df['PSNR_Moj'] - df['PSNR_Njihov'], ddof=1)
-d_ssim = np.mean(df['SSIM_Moj'] - df['SSIM_Njihov']) / np.std(df['SSIM_Moj'] - df['SSIM_Njihov'], ddof=1)
-d_lpips = np.mean(df['LPIPS_Moj'] - df['LPIPS_Njihov']) / np.std(df['LPIPS_Moj'] - df['LPIPS_Njihov'], ddof=1)
+d_psnr = np.mean(df_stat_direct['PSNR_Moj'] - df_stat_direct['PSNR_Njihov']) / np.std(df_stat_direct['PSNR_Moj'] - df_stat_direct['PSNR_Njihov'], ddof=1)
+d_ssim = np.mean(df_stat_direct['SSIM_Moj'] - df_stat_direct['SSIM_Njihov']) / np.std(df_stat_direct['SSIM_Moj'] - df_stat_direct['SSIM_Njihov'], ddof=1)
+d_lpips = np.mean(df_stat_direct['LPIPS_Moj'] - df_stat_direct['LPIPS_Njihov']) / np.std(df_stat_direct['LPIPS_Moj'] - df_stat_direct['LPIPS_Njihov'], ddof=1)
 
 tabela_direktna = [
-    ['PSNR (dB) [↑]', f"{df['PSNR_Moj'].mean():.2f}", f"{df['PSNR_Njihov'].mean():.2f}", f"+{df['PSNR_Moj'].mean() - df['PSNR_Njihov'].mean():.2f} dB", format_p_val(p_w_p), format_p_val(p_t_p), f"{d_psnr:.2f}"],
-    ['SSIM [↑]', f"{df['SSIM_Moj'].mean():.4f}", f"{df['SSIM_Njihov'].mean():.4f}", f"+{df['SSIM_Moj'].mean() - df['SSIM_Njihov'].mean():.4f}", format_p_val(p_w_s), format_p_val(p_t_s), f"{d_ssim:.2f}"],
-    ['LPIPS [↓]', f"{df['LPIPS_Moj'].mean():.4f}", f"{df['LPIPS_Njihov'].mean():.4f}", f"{df['LPIPS_Moj'].mean() - df['LPIPS_Njihov'].mean():.4f}", format_p_val(p_w_l), format_p_val(p_t_l), f"{d_lpips:.2f}"],
+    ['PSNR (dB) [↑]', f"{np.mean(runs_direct_moj_psnr):.2f}", f"{np.mean(runs_direct_nj_psnr):.2f}", f"+{np.mean(runs_direct_moj_psnr) - np.mean(runs_direct_nj_psnr):.2f} dB", format_p_val(p_w_p), format_p_val(p_t_p), f"{d_psnr:.2f}"],
+    ['SSIM [↑]', f"{np.mean(runs_direct_moj_ssim):.4f}", f"{np.mean(runs_direct_nj_ssim):.4f}", f"+{np.mean(runs_direct_moj_ssim) - np.mean(runs_direct_nj_ssim):.4f}", format_p_val(p_w_s), format_p_val(p_t_s), f"{d_ssim:.2f}"],
+    ['LPIPS [↓]', f"{np.mean(runs_direct_moj_lpips):.4f}", f"{np.mean(runs_direct_nj_lpips):.4f}", f"{np.mean(runs_direct_moj_lpips) - np.mean(runs_direct_nj_lpips):.4f}", format_p_val(p_w_l), format_p_val(p_t_l), f"{d_lpips:.2f}"],
     ['FID [↓]', f"{fid_moj:.2f}", f"{fid_nj:.2f}", f"{fid_moj - fid_nj:.2f}", "-", "-", "-"]
 ]
+headers_direktna = ['Metrika', 'Vaš Model (Mean)', 'Microsoft (Mean)', 'Δ Razlika', 'Wilcoxon', 'Paired t-test', "Cohen's d"]
 
-headers_direktna = ['Metrika', 'Vaš Model', 'Microsoft (Finetuned)', 'Δ Razlika', 'Wilcoxon', 'Paired t-test', "Cohen's d"]
-df.to_csv(os.path.join(DRIVE_PROJECT_DIR, 'uporedna_evaluacija_direktno.csv'), index=False)
+# Čuvanje svih 5 iteracija za direktno poređenje u CSV
+df_direct_runs = pd.DataFrame([
+    {
+        'Model': 'Vaš Model',
+        'Metrika': 'PSNR (dB)',
+        'Iter_1': runs_direct_moj_psnr[0], 'Iter_2': runs_direct_moj_psnr[1], 'Iter_3': runs_direct_moj_psnr[2],
+        'Iter_4': runs_direct_moj_psnr[3], 'Iter_5': runs_direct_moj_psnr[4],
+        'Srednja_Vrednost': np.mean(runs_direct_moj_psnr), 'Std_Dev': np.std(runs_direct_moj_psnr)
+    },
+    {
+        'Model': 'Vaš Model',
+        'Metrika': 'SSIM',
+        'Iter_1': runs_direct_moj_ssim[0], 'Iter_2': runs_direct_moj_ssim[1], 'Iter_3': runs_direct_moj_ssim[2],
+        'Iter_4': runs_direct_moj_ssim[3], 'Iter_5': runs_direct_moj_ssim[4],
+        'Srednja_Vrednost': np.mean(runs_direct_moj_ssim), 'Std_Dev': np.std(runs_direct_moj_ssim)
+    },
+    {
+        'Model': 'Vaš Model',
+        'Metrika': 'LPIPS',
+        'Iter_1': runs_direct_moj_lpips[0], 'Iter_2': runs_direct_moj_lpips[1], 'Iter_3': runs_direct_moj_lpips[2],
+        'Iter_4': runs_direct_moj_lpips[3], 'Iter_5': runs_direct_moj_lpips[4],
+        'Srednja_Vrednost': np.mean(runs_direct_moj_lpips), 'Std_Dev': np.std(runs_direct_moj_lpips)
+    },
+    {
+        'Model': 'Microsoft (Finetuned)',
+        'Metrika': 'PSNR (dB)',
+        'Iter_1': runs_direct_nj_psnr[0], 'Iter_2': runs_direct_nj_psnr[1], 'Iter_3': runs_direct_nj_psnr[2],
+        'Iter_4': runs_direct_nj_psnr[3], 'Iter_5': runs_direct_nj_psnr[4],
+        'Srednja_Vrednost': np.mean(runs_direct_nj_psnr), 'Std_Dev': np.std(runs_direct_nj_psnr)
+    },
+    {
+        'Model': 'Microsoft (Finetuned)',
+        'Metrika': 'SSIM',
+        'Iter_1': runs_direct_nj_ssim[0], 'Iter_2': runs_direct_nj_ssim[1], 'Iter_3': runs_direct_nj_ssim[2],
+        'Iter_4': runs_direct_nj_ssim[3], 'Iter_5': runs_direct_nj_ssim[4],
+        'Srednja_Vrednost': np.mean(runs_direct_nj_ssim), 'Std_Dev': np.std(runs_direct_nj_ssim)
+    },
+    {
+        'Model': 'Microsoft (Finetuned)',
+        'Metrika': 'LPIPS',
+        'Iter_1': runs_direct_nj_lpips[0], 'Iter_2': runs_direct_nj_lpips[1], 'Iter_3': runs_direct_nj_lpips[2],
+        'Iter_4': runs_direct_nj_lpips[3], 'Iter_5': runs_direct_nj_lpips[4],
+        'Srednja_Vrednost': np.mean(runs_direct_nj_lpips), 'Std_Dev': np.std(runs_direct_nj_lpips)
+    }
+])
+df_direct_runs.to_csv(os.path.join(DIR_ABLACIJA_DRIVE, 'direktno_poredjenje_5_iteracija.csv'), index=False)
 
 
 # =============================================================
-# 1. POJEDINAČNA ABLACIJA (1-po-1 blok se isključuje)
+# 1. POJEDINAČNA ABLACIJA (1-po-1 blok se isključuje) - 5 ITERACIJA
 # =============================================================
 ablation_configs = [
     ("Full Proposed Model",                   dict()),
@@ -784,9 +855,11 @@ ablation_configs = [
     ("10. w/o Contrast Color Recovery (CCR)", dict(use_ccr=False)),
 ]
 
-raw_data = {cfg_name: {'PSNR': [], 'SSIM': [], 'LPIPS': []} for cfg_name, _ in ablation_configs}
+cached_1po1_results = {}
+print(f"\n[INFO] Evaluacija konfiguracija za 1-po-1 ablaciju...")
 
-for naziv, cfg in ablation_configs:
+for naziv, cfg in tqdm(ablation_configs, desc="1-po-1 Eval"):
+    res_list = []
     with torch.no_grad():
         for fname in val_files:
             c_p = os.path.join(DIR_VAL_CLEAN, fname)
@@ -809,32 +882,71 @@ for naziv, cfg in ablation_configs:
             ssim_val = ssim_metric(c_img, out_np, channel_axis=2, data_range=1.0)
             lpips_val = eval_lpips_fn(out_eval_t, c_eval_t).item()
 
-            raw_data[naziv]['PSNR'].append(psnr_val)
-            raw_data[naziv]['SSIM'].append(ssim_val)
-            raw_data[naziv]['LPIPS'].append(lpips_val)
+            res_list.append({'Fname': fname, 'PSNR': psnr_val, 'SSIM': ssim_val, 'LPIPS': lpips_val})
+
+    cached_1po1_results[naziv] = pd.DataFrame(res_list).set_index('Fname')
+
+# Bootstrap 5 iteracija za 1-po-1
+raw_data_runs_1po1 = {
+    cfg_name: {'PSNR_runs': [], 'SSIM_runs': [], 'LPIPS_runs': []}
+    for cfg_name, _ in ablation_configs
+}
+
+for iter_idx in range(NUM_ITERACIJA):
+    rng = np.random.default_rng(seed=42 + iter_idx)
+    boot_files = rng.choice(val_files, size=len(val_files), replace=True)
+    for naziv, _ in ablation_configs:
+        df_sub = cached_1po1_results[naziv].loc[boot_files]
+        raw_data_runs_1po1[naziv]['PSNR_runs'].append(df_sub['PSNR'].mean())
+        raw_data_runs_1po1[naziv]['SSIM_runs'].append(df_sub['SSIM'].mean())
+        raw_data_runs_1po1[naziv]['LPIPS_runs'].append(df_sub['LPIPS'].mean())
 
 summary_abl = []
+csv_abl_1po1_rows = []
+
 for naziv, _ in ablation_configs:
+    p_runs = raw_data_runs_1po1[naziv]['PSNR_runs']
+    s_runs = raw_data_runs_1po1[naziv]['SSIM_runs']
+    l_runs = raw_data_runs_1po1[naziv]['LPIPS_runs']
+
+    p_mean = np.mean(p_runs)
+    s_mean = np.mean(s_runs)
+    l_mean = np.mean(l_runs)
+
     summary_abl.append([
         naziv,
-        f"{np.mean(raw_data[naziv]['PSNR']):.2f}",
-        f"{np.mean(raw_data[naziv]['SSIM']):.4f}",
-        f"{np.mean(raw_data[naziv]['LPIPS']):.4f}"
+        f"{p_runs[0]:.2f}", f"{p_runs[1]:.2f}", f"{p_runs[2]:.2f}", f"{p_runs[3]:.2f}", f"{p_runs[4]:.2f}",
+        f"{p_mean:.2f}",
+        f"{s_mean:.4f}",
+        f"{l_mean:.4f}"
     ])
-headers_abl_mean = ['Konfiguracija Modela (Po Redosledu)', 'PSNR (dB) [↑]', 'SSIM [↑]', 'LPIPS [↓]']
 
-full_p = np.array(raw_data["Full Proposed Model"]['PSNR'])
-full_s = np.array(raw_data["Full Proposed Model"]['SSIM'])
-full_l = np.array(raw_data["Full Proposed Model"]['LPIPS'])
+    csv_abl_1po1_rows.append({
+        'Konfiguracija': naziv,
+        'PSNR_Iter_1': p_runs[0], 'PSNR_Iter_2': p_runs[1], 'PSNR_Iter_3': p_runs[2], 'PSNR_Iter_4': p_runs[3], 'PSNR_Iter_5': p_runs[4],
+        'PSNR_Mean': p_mean, 'PSNR_Std': np.std(p_runs),
+        'SSIM_Iter_1': s_runs[0], 'SSIM_Iter_2': s_runs[1], 'SSIM_Iter_3': s_runs[2], 'SSIM_Iter_4': s_runs[3], 'SSIM_Iter_5': s_runs[4],
+        'SSIM_Mean': s_mean, 'SSIM_Std': np.std(s_runs),
+        'LPIPS_Iter_1': l_runs[0], 'LPIPS_Iter_2': l_runs[1], 'LPIPS_Iter_3': l_runs[2], 'LPIPS_Iter_4': l_runs[3], 'LPIPS_Iter_5': l_runs[4],
+        'LPIPS_Mean': l_mean, 'LPIPS_Std': np.std(l_runs)
+    })
+
+headers_abl_mean = ['Konfiguracija Modela', 'It. 1', 'It. 2', 'It. 3', 'It. 4', 'It. 5', 'PSNR (Mean) [↑]', 'SSIM (Mean) [↑]', 'LPIPS (Mean) [↓]']
+pd.DataFrame(csv_abl_1po1_rows).to_csv(os.path.join(DIR_ABLACIJA_DRIVE, 'ablacija_1po1_5_iteracija.csv'), index=False)
+
+# Statistika za 1-po-1 (na punom originalnom skupu)
+full_p = cached_1po1_results["Full Proposed Model"]['PSNR'].values
+full_s = cached_1po1_results["Full Proposed Model"]['SSIM'].values
+full_l = cached_1po1_results["Full Proposed Model"]['LPIPS'].values
 
 stat_abl_table = []
 for naziv, _ in ablation_configs:
     if naziv == "Full Proposed Model":
         continue
 
-    var_p = np.array(raw_data[naziv]['PSNR'])
-    var_s = np.array(raw_data[naziv]['SSIM'])
-    var_l = np.array(raw_data[naziv]['LPIPS'])
+    var_p = cached_1po1_results[naziv]['PSNR'].values
+    var_s = cached_1po1_results[naziv]['SSIM'].values
+    var_l = cached_1po1_results[naziv]['LPIPS'].values
 
     diff_p = full_p - var_p
     _, p_w_p = stats.wilcoxon(full_p, var_p)
@@ -855,13 +967,11 @@ for naziv, _ in ablation_configs:
     ])
 
 headers_abl_stat = ['Uklonjena Komponenta', 'Δ PSNR', 'Wilcoxon (PSNR)', 't-test (PSNR)', "Cohen's d", 'Wilcoxon (SSIM)', 'Wilcoxon (LPIPS)']
-
-pd.DataFrame(summary_abl, columns=headers_abl_mean).to_csv(os.path.join(DIR_ABLACIJA_DRIVE, 'ablacija_1po1_metrike.csv'), index=False)
 pd.DataFrame(stat_abl_table, columns=headers_abl_stat).to_csv(os.path.join(DIR_ABLACIJA_DRIVE, 'ablacija_1po1_statistika.csv'), index=False)
 
 
 # =============================================================
-# 2. KOMBINATORNA ABLACIJA KRITIČNIH MODULA (Po 2, Sva 4, Samo 4, Barebones)
+# 2. KOMBINATORNA ABLACIJA KRITIČNIH MODULA - 5 ITERACIJA
 # =============================================================
 crit_components = [
     ("Spectral", "use_spectral"),
@@ -892,9 +1002,11 @@ pairwise_configs = [
     })
 ]
 
-pairwise_data = {cfg_name: {'PSNR': [], 'SSIM': [], 'LPIPS': []} for cfg_name, _ in pairwise_configs}
+cached_pair_results = {}
+print(f"\n[INFO] Evaluacija konfiguracija za Kombinatornu ablaciju...")
 
-for naziv, cfg in pairwise_configs:
+for naziv, cfg in tqdm(pairwise_configs, desc="Kombinatorna Eval"):
+    res_list = []
     with torch.no_grad():
         for fname in val_files:
             c_p = os.path.join(DIR_VAL_CLEAN, fname)
@@ -917,28 +1029,67 @@ for naziv, cfg in pairwise_configs:
             ssim_val = ssim_metric(c_img, out_np, channel_axis=2, data_range=1.0)
             lpips_val = eval_lpips_fn(out_eval_t, c_eval_t).item()
 
-            pairwise_data[naziv]['PSNR'].append(psnr_val)
-            pairwise_data[naziv]['SSIM'].append(ssim_val)
-            pairwise_data[naziv]['LPIPS'].append(lpips_val)
+            res_list.append({'Fname': fname, 'PSNR': psnr_val, 'SSIM': ssim_val, 'LPIPS': lpips_val})
+
+    cached_pair_results[naziv] = pd.DataFrame(res_list).set_index('Fname')
+
+# Bootstrap 5 iteracija za Kombinatornu
+pairwise_data_runs = {
+    cfg_name: {'PSNR_runs': [], 'SSIM_runs': [], 'LPIPS_runs': []}
+    for cfg_name, _ in pairwise_configs
+}
+
+for iter_idx in range(NUM_ITERACIJA):
+    rng = np.random.default_rng(seed=42 + iter_idx)
+    boot_files = rng.choice(val_files, size=len(val_files), replace=True)
+    for naziv, _ in pairwise_configs:
+        df_sub = cached_pair_results[naziv].loc[boot_files]
+        pairwise_data_runs[naziv]['PSNR_runs'].append(df_sub['PSNR'].mean())
+        pairwise_data_runs[naziv]['SSIM_runs'].append(df_sub['SSIM'].mean())
+        pairwise_data_runs[naziv]['LPIPS_runs'].append(df_sub['LPIPS'].mean())
 
 summary_pair = []
+csv_abl_pair_rows = []
+
 for naziv, _ in pairwise_configs:
+    p_runs = pairwise_data_runs[naziv]['PSNR_runs']
+    s_runs = pairwise_data_runs[naziv]['SSIM_runs']
+    l_runs = pairwise_data_runs[naziv]['LPIPS_runs']
+
+    p_mean = np.mean(p_runs)
+    s_mean = np.mean(s_runs)
+    l_mean = np.mean(l_runs)
+
     summary_pair.append([
         naziv,
-        f"{np.mean(pairwise_data[naziv]['PSNR']):.2f}",
-        f"{np.mean(pairwise_data[naziv]['SSIM']):.4f}",
-        f"{np.mean(pairwise_data[naziv]['LPIPS']):.4f}"
+        f"{p_runs[0]:.2f}", f"{p_runs[1]:.2f}", f"{p_runs[2]:.2f}", f"{p_runs[3]:.2f}", f"{p_runs[4]:.2f}",
+        f"{p_mean:.2f}",
+        f"{s_mean:.4f}",
+        f"{l_mean:.4f}"
     ])
-headers_pair_mean = ['Konfiguracija Modela (Kombinatorna)', 'PSNR (dB) [↑]', 'SSIM [↑]', 'LPIPS [↓]']
 
+    csv_abl_pair_rows.append({
+        'Konfiguracija': naziv,
+        'PSNR_Iter_1': p_runs[0], 'PSNR_Iter_2': p_runs[1], 'PSNR_Iter_3': p_runs[2], 'PSNR_Iter_4': p_runs[3], 'PSNR_Iter_5': p_runs[4],
+        'PSNR_Mean': p_mean, 'PSNR_Std': np.std(p_runs),
+        'SSIM_Iter_1': s_runs[0], 'SSIM_Iter_2': s_runs[1], 'SSIM_Iter_3': s_runs[2], 'SSIM_Iter_4': s_runs[3], 'SSIM_Iter_5': s_runs[4],
+        'SSIM_Mean': s_mean, 'SSIM_Std': np.std(s_runs),
+        'LPIPS_Iter_1': l_runs[0], 'LPIPS_Iter_2': l_runs[1], 'LPIPS_Iter_3': l_runs[2], 'LPIPS_Iter_4': l_runs[3], 'LPIPS_Iter_5': l_runs[4],
+        'LPIPS_Mean': l_mean, 'LPIPS_Std': np.std(l_runs)
+    })
+
+headers_pair_mean = ['Konfiguracija Modela', 'It. 1', 'It. 2', 'It. 3', 'It. 4', 'It. 5', 'PSNR (Mean) [↑]', 'SSIM (Mean) [↑]', 'LPIPS (Mean) [↓]']
+pd.DataFrame(csv_abl_pair_rows).to_csv(os.path.join(DIR_ABLACIJA_DRIVE, 'ablacija_kombinatorna_5_iteracija.csv'), index=False)
+
+# Statistika za Kombinatornu (na punom originalnom skupu)
 stat_pair_table = []
 for naziv, _ in pairwise_configs:
     if naziv == "Full Proposed Model":
         continue
 
-    var_p = np.array(pairwise_data[naziv]['PSNR'])
-    var_s = np.array(pairwise_data[naziv]['SSIM'])
-    var_l = np.array(pairwise_data[naziv]['LPIPS'])
+    var_p = cached_pair_results[naziv]['PSNR'].values
+    var_s = cached_pair_results[naziv]['SSIM'].values
+    var_l = cached_pair_results[naziv]['LPIPS'].values
 
     diff_p = full_p - var_p
     _, p_w_p = stats.wilcoxon(full_p, var_p)
@@ -959,125 +1110,33 @@ for naziv, _ in pairwise_configs:
     ])
 
 headers_pair_stat = ['Uklonjena Komponenta', 'Δ PSNR', 'Wilcoxon (PSNR)', 't-test (PSNR)', "Cohen's d", 'Wilcoxon (SSIM)', 'Wilcoxon (LPIPS)']
-
-pd.DataFrame(summary_pair, columns=headers_pair_mean).to_csv(os.path.join(DIR_ABLACIJA_DRIVE, 'ablacija_kombinatorna_metrike.csv'), index=False)
 pd.DataFrame(stat_pair_table, columns=headers_pair_stat).to_csv(os.path.join(DIR_ABLACIJA_DRIVE, 'ablacija_kombinatorna_statistika.csv'), index=False)
 
 
-# =============================================================
-# 3. GENERISANJE I ČUVANJE 6 GRAFIKA
-# =============================================================
-plt.style.use('seaborn-v0_8-whitegrid' if 'seaborn-v0_8-whitegrid' in plt.style.available else 'default')
-cfg_names = [c[0] for c in pairwise_configs]
-short_labels = [
-    "Full Model", "w/o All 4", "w/o [Spec+Edge]", "w/o [Spec+CCR]",
-    "w/o [Spec+Skip]", "w/o [Edge+CCR]", "w/o [Edge+Skip]", "w/o [CCR+Skip]",
-    "Only 4 Active", "Barebones"
-]
-
-mean_psnrs = [np.mean(pairwise_data[c]['PSNR']) for c in cfg_names]
-mean_ssims = [np.mean(pairwise_data[c]['SSIM']) for c in cfg_names]
-mean_lpips = [np.mean(pairwise_data[c]['LPIPS']) for c in cfg_names]
-
-# Grafik 1: PSNR Poređenje
-plt.figure(figsize=(12, 6))
-bars = plt.barh(short_labels[::-1], mean_psnrs[::-1], color='#1f77b4', edgecolor='black')
-plt.title('Grafik 1: PSNR (dB) po Režimima Ablacije [Veće je bolje]', fontsize=14, fontweight='bold')
-plt.xlabel('PSNR (dB)', fontsize=12)
-for bar in bars:
-    plt.text(bar.get_width() + 0.3, bar.get_y() + bar.get_height()/2, f"{bar.get_width():.2f}", va='center', fontsize=10)
-plt.tight_layout()
-plt.savefig(os.path.join(DIR_ABLACIJA_DRIVE, 'grafik_1_psnr_ablacija.png'), dpi=300)
-plt.show()
-
-# Grafik 2: SSIM Poređenje
-plt.figure(figsize=(12, 6))
-bars = plt.barh(short_labels[::-1], mean_ssims[::-1], color='#2ca02c', edgecolor='black')
-plt.title('Grafik 2: SSIM po Režimima Ablacije [Veće je bolje]', fontsize=14, fontweight='bold')
-plt.xlabel('SSIM', fontsize=12)
-for bar in bars:
-    plt.text(bar.get_width() + 0.01, bar.get_y() + bar.get_height()/2, f"{bar.get_width():.4f}", va='center', fontsize=10)
-plt.tight_layout()
-plt.savefig(os.path.join(DIR_ABLACIJA_DRIVE, 'grafik_2_ssim_ablacija.png'), dpi=300)
-plt.show()
-
-# Grafik 3: LPIPS Perceptivni Gubitak
-plt.figure(figsize=(12, 6))
-bars = plt.barh(short_labels[::-1], mean_lpips[::-1], color='#d62728', edgecolor='black')
-plt.title('Grafik 3: LPIPS Perceptual Distance [Manje je bolje]', fontsize=14, fontweight='bold')
-plt.xlabel('LPIPS', fontsize=12)
-for bar in bars:
-    plt.text(bar.get_width() + 0.005, bar.get_y() + bar.get_height()/2, f"{bar.get_width():.4f}", va='center', fontsize=10)
-plt.tight_layout()
-plt.savefig(os.path.join(DIR_ABLACIJA_DRIVE, 'grafik_3_lpips_ablacija.png'), dpi=300)
-plt.show()
-
-# Grafik 4: Boxplot Distribucije PSNR-a
-plt.figure(figsize=(14, 7))
-psnr_dist = [pairwise_data[c]['PSNR'] for c in cfg_names]
-plt.boxplot(psnr_dist, labels=short_labels, patch_artist=True, boxprops=dict(facecolor='#aec7e8', color='black'))
-plt.title('Grafik 4: Distribucija PSNR Vrednosti po Uzorcima (Boxplot)', fontsize=14, fontweight='bold')
-plt.ylabel('PSNR (dB)', fontsize=12)
-plt.xticks(rotation=30, ha='right')
-plt.tight_layout()
-plt.savefig(os.path.join(DIR_ABLACIJA_DRIVE, 'grafik_4_psnr_boxplot.png'), dpi=300)
-plt.show()
-
-# Grafik 5: Pad Performansi u odnosu na Full Model (Δ PSNR)
-plt.figure(figsize=(12, 6))
-deltas = [np.mean(full_p) - np.mean(pairwise_data[c]['PSNR']) for c in cfg_names[1:]]
-bars = plt.bar(short_labels[1:], deltas, color='#ff7f0e', edgecolor='black')
-plt.title('Grafik 5: Pad Performansi u Odnosu na Full Model (Δ PSNR)', fontsize=14, fontweight='bold')
-plt.ylabel('Pad PSNR-a (dB)', fontsize=12)
-plt.xticks(rotation=30, ha='right')
-for bar in bars:
-    plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.2, f"-{bar.get_height():.2f}dB", ha='center', fontsize=10)
-plt.tight_layout()
-plt.savefig(os.path.join(DIR_ABLACIJA_DRIVE, 'grafik_5_delta_psnr.png'), dpi=300)
-plt.show()
-
-# Grafik 6: Cohen's d (Veličina efekta pada performansi)
-plt.figure(figsize=(12, 6))
-cohen_vals = []
-for c in cfg_names[1:]:
-    diff = full_p - np.array(pairwise_data[c]['PSNR'])
-    d = np.mean(diff) / np.std(diff, ddof=1) if np.std(diff, ddof=1) > 0 else 0.0
-    cohen_vals.append(d)
-
-bars = plt.bar(short_labels[1:], cohen_vals, color='#9467bd', edgecolor='black')
-plt.title("Grafik 6: Statistička Veličina Efekta (Cohen's d)", fontsize=14, fontweight='bold')
-plt.ylabel("Cohen's d", fontsize=12)
-plt.xticks(rotation=30, ha='right')
-for bar in bars:
-    plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.1, f"{bar.get_height():.2f}", ha='center', fontsize=10)
-plt.tight_layout()
-plt.savefig(os.path.join(DIR_ABLACIJA_DRIVE, 'grafik_6_cohens_d.png'), dpi=300)
-plt.show()
-
-
-# tabelice i to 
-print("\n" + "█" * 98)
-print("  poredjenje moj vs njihov ")
-print("█" * 98)
+# tabelice i prikazivanje njihovo u terminalu 
+print("\n" + "█" * 115)
+print("  poređenje mog i njihvoog modela ")
+print("█" * 115)
 print(tabulate(tabela_direktna, headers=headers_direktna, tablefmt="fancy_grid", stralign="center", numalign="center"))
 
-print("\n" + "█" * 98)
-print(f"  ablacija 1-po-1 blok (N = {len(val_files)})")
-print("█" * 98)
+print("\n" + "█" * 115)
+print(f"  ABLACIJA 1-PO-1 BLOK (Prikaz svih 5 iteracija i srednje vrednosti | N = {len(val_files)})")
+print("█" * 115)
 print(tabulate(summary_abl, headers=headers_abl_mean, tablefmt="fancy_grid", stralign="center", numalign="center"))
 
-print("\n" + "█" * 98)
-print("  statisticki testic 1-po-1 :3")
-print("█" * 98)
+print("\n" + "█" * 115)
+print("  statistički testić jedna po jedan ")
+print("█" * 115)
 print(tabulate(stat_abl_table, headers=headers_abl_stat, tablefmt="fancy_grid", stralign="center", numalign="center"))
 
-print("\n" + "█" * 98)
-print(f"  kombinatorna ablacija kritičnih modula (N = {len(val_files)})")
-print("█" * 98)
+print("\n" + "█" * 115)
+print(f"  KOMBINATORNA ABLACIJA KRITIČNIH MODULA (Prikaz svih 5 iteracija i srednje vrednosti | N = {len(val_files)})")
+print("█" * 115)
 print(tabulate(summary_pair, headers=headers_pair_mean, tablefmt="fancy_grid", stralign="center", numalign="center"))
 
-print("\n" + "█" * 98)
-print("  statisticki testic kombinatorni :3")
-print("█" * 98)
+print("\n" + "█" * 115)
+print("  STATISTIČKI TESTOVI KOMBINATORNI :3")
+print("█" * 115)
 print(tabulate(stat_pair_table, headers=headers_pair_stat, tablefmt="fancy_grid", stralign="center", numalign="center"))
-print("\nLegenda statističke značajnosti: *** p < 0.001  |  ** p < 0.01  |  * p < 0.05  |  ns: nije značajno\n")
+print("\nLegenda statističke značajnosti: *** p < 0.001  |  ** p < 0.01  |  * p < 0.05  |  ns: nije značajno")
+print(f"\n✓ Sve tabele sa svih 5 iteracija i tačnim srednjim vrednostima sačuvane su na Drive u folderu:\n  ➜ {DIR_ABLACIJA_DRIVE}\n")
