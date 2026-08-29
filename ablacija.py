@@ -324,7 +324,7 @@ class GatedFusionRestorationBlock(nn.Module):
         super().__init__()
         self.spatial_proj = nn.Conv2d(spatial_ch, out_ch, 1, bias=False)
         self.spectral_proj = nn.Conv2d(spectral_ch, out_ch, 1, bias=False)
-        self.gate = nn.Sequential(
+        self.gate = nn.Entry = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
             nn.Linear(out_ch * 2, out_ch // 4, bias=False),
@@ -788,47 +788,47 @@ tabela_direktna = [
     ['LPIPS [↓]', f"{np.mean(runs_direct_moj_lpips):.4f}", f"{np.mean(runs_direct_nj_lpips):.4f}", f"{np.mean(runs_direct_moj_lpips) - np.mean(runs_direct_nj_lpips):.4f}", format_p_val(p_w_l), format_p_val(p_t_l), f"{d_lpips:.2f}"],
     ['FID [↓]', f"{fid_moj:.2f}", f"{fid_nj:.2f}", f"{fid_moj - fid_nj:.2f}", "-", "-", "-"]
 ]
-headers_direktna = ['Metrika', 'Vaš Model (Mean)', 'Microsoft (Mean)', 'Δ Razlika', 'Wilcoxon', 'Paired t-test', "Cohen's d"]
+headers_direktna = ['Metrika', 'Moj Model (Mean)', 'Njihov Model (Mean)', 'Δ Razlika', 'Wilcoxon', 'Paired t-test', "Cohen's d"]
 
 # Čuvanje svih 5 iteracija za direktno poređenje u CSV
 df_direct_runs = pd.DataFrame([
     {
-        'Model': 'Vaš Model',
+        'Model': 'Moj Model',
         'Metrika': 'PSNR (dB)',
         'Iter_1': runs_direct_moj_psnr[0], 'Iter_2': runs_direct_moj_psnr[1], 'Iter_3': runs_direct_moj_psnr[2],
         'Iter_4': runs_direct_moj_psnr[3], 'Iter_5': runs_direct_moj_psnr[4],
         'Srednja_Vrednost': np.mean(runs_direct_moj_psnr), 'Std_Dev': np.std(runs_direct_moj_psnr)
     },
     {
-        'Model': 'Vaš Model',
+        'Model': 'Moj Model',
         'Metrika': 'SSIM',
         'Iter_1': runs_direct_moj_ssim[0], 'Iter_2': runs_direct_moj_ssim[1], 'Iter_3': runs_direct_moj_ssim[2],
         'Iter_4': runs_direct_moj_ssim[3], 'Iter_5': runs_direct_moj_ssim[4],
         'Srednja_Vrednost': np.mean(runs_direct_moj_ssim), 'Std_Dev': np.std(runs_direct_moj_ssim)
     },
     {
-        'Model': 'Vaš Model',
+        'Model': 'Moj Model',
         'Metrika': 'LPIPS',
         'Iter_1': runs_direct_moj_lpips[0], 'Iter_2': runs_direct_moj_lpips[1], 'Iter_3': runs_direct_moj_lpips[2],
         'Iter_4': runs_direct_moj_lpips[3], 'Iter_5': runs_direct_moj_lpips[4],
         'Srednja_Vrednost': np.mean(runs_direct_moj_lpips), 'Std_Dev': np.std(runs_direct_moj_lpips)
     },
     {
-        'Model': 'Microsoft (Finetuned)',
+        'Model': 'Njihov Model',
         'Metrika': 'PSNR (dB)',
         'Iter_1': runs_direct_nj_psnr[0], 'Iter_2': runs_direct_nj_psnr[1], 'Iter_3': runs_direct_nj_psnr[2],
         'Iter_4': runs_direct_nj_psnr[3], 'Iter_5': runs_direct_nj_psnr[4],
         'Srednja_Vrednost': np.mean(runs_direct_nj_psnr), 'Std_Dev': np.std(runs_direct_nj_psnr)
     },
     {
-        'Model': 'Microsoft (Finetuned)',
+        'Model': 'Njihov Model',
         'Metrika': 'SSIM',
         'Iter_1': runs_direct_nj_ssim[0], 'Iter_2': runs_direct_nj_ssim[1], 'Iter_3': runs_direct_nj_ssim[2],
         'Iter_4': runs_direct_nj_ssim[3], 'Iter_5': runs_direct_nj_ssim[4],
         'Srednja_Vrednost': np.mean(runs_direct_nj_ssim), 'Std_Dev': np.std(runs_direct_nj_ssim)
     },
     {
-        'Model': 'Microsoft (Finetuned)',
+        'Model': 'Njihov Model',
         'Metrika': 'LPIPS',
         'Iter_1': runs_direct_nj_lpips[0], 'Iter_2': runs_direct_nj_lpips[1], 'Iter_3': runs_direct_nj_lpips[2],
         'Iter_4': runs_direct_nj_lpips[3], 'Iter_5': runs_direct_nj_lpips[4],
@@ -838,9 +838,7 @@ df_direct_runs = pd.DataFrame([
 df_direct_runs.to_csv(os.path.join(DIR_ABLACIJA_DRIVE, 'direktno_poredjenje_5_iteracija.csv'), index=False)
 
 
-# =============================================================
-# 1. POJEDINAČNA ABLACIJA (1-po-1 blok se isključuje) - 5 ITERACIJA
-# =============================================================
+#pojedinačmna balacija 5 iteracija
 ablation_configs = [
     ("Full Proposed Model",                   dict()),
     ("1. w/o Spatial Encoder Stream",         dict(use_spatial=False)),
@@ -886,7 +884,7 @@ for naziv, cfg in tqdm(ablation_configs, desc="1-po-1 Eval"):
 
     cached_1po1_results[naziv] = pd.DataFrame(res_list).set_index('Fname')
 
-# Bootstrap 5 iteracija za 1-po-1
+# 5 iteracija
 raw_data_runs_1po1 = {
     cfg_name: {'PSNR_runs': [], 'SSIM_runs': [], 'LPIPS_runs': []}
     for cfg_name, _ in ablation_configs
@@ -970,9 +968,7 @@ headers_abl_stat = ['Uklonjena Komponenta', 'Δ PSNR', 'Wilcoxon (PSNR)', 't-tes
 pd.DataFrame(stat_abl_table, columns=headers_abl_stat).to_csv(os.path.join(DIR_ABLACIJA_DRIVE, 'ablacija_1po1_statistika.csv'), index=False)
 
 
-# =============================================================
-# 2. KOMBINATORNA ABLACIJA KRITIČNIH MODULA - 5 ITERACIJA
-# =============================================================
+
 crit_components = [
     ("Spectral", "use_spectral"),
     ("EdgeBranch", "use_edge_branch"),
@@ -1113,30 +1109,29 @@ headers_pair_stat = ['Uklonjena Komponenta', 'Δ PSNR', 'Wilcoxon (PSNR)', 't-te
 pd.DataFrame(stat_pair_table, columns=headers_pair_stat).to_csv(os.path.join(DIR_ABLACIJA_DRIVE, 'ablacija_kombinatorna_statistika.csv'), index=False)
 
 
-# tabelice i prikazivanje njihovo u terminalu 
+# prikaz svega u terminalu 
 print("\n" + "█" * 115)
-print("  poređenje mog i njihvoog modela ")
+print("  moji vs njihovi rezultati ")
 print("█" * 115)
 print(tabulate(tabela_direktna, headers=headers_direktna, tablefmt="fancy_grid", stralign="center", numalign="center"))
 
 print("\n" + "█" * 115)
-print(f"  ABLACIJA 1-PO-1 BLOK (Prikaz svih 5 iteracija i srednje vrednosti | N = {len(val_files)})")
+print(f"  jedna po jedno uklanjanje za ablaciju | N = {len(val_files)})")
 print("█" * 115)
 print(tabulate(summary_abl, headers=headers_abl_mean, tablefmt="fancy_grid", stralign="center", numalign="center"))
 
 print("\n" + "█" * 115)
-print("  statistički testić jedna po jedan ")
+print("  jedan po jedan ablacija :3")
 print("█" * 115)
 print(tabulate(stat_abl_table, headers=headers_abl_stat, tablefmt="fancy_grid", stralign="center", numalign="center"))
 
 print("\n" + "█" * 115)
-print(f"  KOMBINATORNA ABLACIJA KRITIČNIH MODULA (Prikaz svih 5 iteracija i srednje vrednosti | N = {len(val_files)})")
+print(f"  | N = {len(val_files)})")
 print("█" * 115)
 print(tabulate(summary_pair, headers=headers_pair_mean, tablefmt="fancy_grid", stralign="center", numalign="center"))
 
 print("\n" + "█" * 115)
-print("  STATISTIČKI TESTOVI KOMBINATORNI :3")
+print("  statisticki testovi :3")
 print("█" * 115)
 print(tabulate(stat_pair_table, headers=headers_pair_stat, tablefmt="fancy_grid", stralign="center", numalign="center"))
 print("\nLegenda statističke značajnosti: *** p < 0.001  |  ** p < 0.01  |  * p < 0.05  |  ns: nije značajno")
-print(f"\n✓ Sve tabele sa svih 5 iteracija i tačnim srednjim vrednostima sačuvane su na Drive u folderu:\n  ➜ {DIR_ABLACIJA_DRIVE}\n")
