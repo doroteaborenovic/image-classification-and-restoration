@@ -767,34 +767,21 @@ headers_direktna = ['Metrika', 'Vaš Model', 'Microsoft (Finetuned)', 'Δ Razlik
 df.to_csv(os.path.join(DRIVE_PROJECT_DIR, 'uporedna_evaluacija_direktno.csv'), index=False)
 
 
-# ovde ide samo sta se iskljucuje iz gore navedenih
-crit_components = [
-    ("Spectral", "use_spectral"),
-    ("EdgeBranch", "use_edge_branch"),
-    ("CCR", "use_ccr"),
-    ("SkipRefine", "use_skip_refine")
-]
-crit_keys = [k for _, k in crit_components]
-
+# =============================================================
+# 1. POJEDINAČNA ABLACIJA (1-po-1 blok se isključuje)
+# =============================================================
 ablation_configs = [
-    ("Full Proposed Model", dict()),
-    ("w/o All 4 Critical [Spectral+Edge+CCR+SkipRefine]", {k: False for k in crit_keys}),
-    ("w/o [Spectral + EdgeBranch]", {"use_spectral": False, "use_edge_branch": False}),
-    ("w/o [Spectral + CCR]", {"use_spectral": False, "use_ccr": False}),
-    ("w/o [Spectral + SkipRefine]", {"use_spectral": False, "use_skip_refine": False}),
-    ("w/o [EdgeBranch + CCR]", {"use_edge_branch": False, "use_ccr": False}),
-    ("w/o [EdgeBranch + SkipRefine]", {"use_edge_branch": False, "use_skip_refine": False}),
-    ("w/o [CCR + SkipRefine]", {"use_ccr": False, "use_skip_refine": False}),
-    ("Only 4 Critical Active (All Secondary OFF)", {
-        "use_spectral": True, "use_edge_branch": True, "use_ccr": True, "use_skip_refine": True,
-        "use_cross_bridge": False, "use_gated_fusion": False, "use_damage_attention": False,
-        "use_dilated_context": False, "use_gated_skips": False
-    }),
-    ("Barebones Backbone (All OFF)", {
-        "use_spectral": False, "use_edge_branch": False, "use_ccr": False, "use_skip_refine": False,
-        "use_cross_bridge": False, "use_gated_fusion": False, "use_damage_attention": False,
-        "use_dilated_context": False, "use_gated_skips": False
-    })
+    ("Full Proposed Model",                   dict()),
+    ("1. w/o Spatial Encoder Stream",         dict(use_spatial=False)),
+    ("2. w/o Spectral Encoder Stream",        dict(use_spectral=False)),
+    ("3. w/o Asymmetric Cross-Bridge",        dict(use_cross_bridge=False)),
+    ("4. w/o Gated Bottleneck Fusion",        dict(use_gated_fusion=False)),
+    ("5. w/o Damage Attention Module",        dict(use_damage_attention=False)),
+    ("6. w/o Bottleneck Dilated Context",     dict(use_dilated_context=False)),
+    ("7. w/o Gated Skip Connections",         dict(use_gated_skips=False)),
+    ("8. w/o Skip Refinement Blocks",         dict(use_skip_refine=False)),
+    ("9. w/o Edge Guidance Branch",           dict(use_edge_branch=False)),
+    ("10. w/o Contrast Color Recovery (CCR)", dict(use_ccr=False)),
 ]
 
 raw_data = {cfg_name: {'PSNR': [], 'SSIM': [], 'LPIPS': []} for cfg_name, _ in ablation_configs}
@@ -869,26 +856,128 @@ for naziv, _ in ablation_configs:
 
 headers_abl_stat = ['Uklonjena Komponenta', 'Δ PSNR', 'Wilcoxon (PSNR)', 't-test (PSNR)', "Cohen's d", 'Wilcoxon (SSIM)', 'Wilcoxon (LPIPS)']
 
-# Čuvanje CSV-ova u poseban folder ablacija na Drive-u
-pd.DataFrame(summary_abl, columns=headers_abl_mean).to_csv(os.path.join(DIR_ABLACIJA_DRIVE, 'ablacija_sumarne_metrike.csv'), index=False)
-stat_df = pd.DataFrame(stat_abl_table, columns=headers_abl_stat)
-stat_df.to_csv(os.path.join(DIR_ABLACIJA_DRIVE, 'ablacija_statisticki_testovi.csv'), index=False)
+pd.DataFrame(summary_abl, columns=headers_abl_mean).to_csv(os.path.join(DIR_ABLACIJA_DRIVE, 'ablacija_1po1_metrike.csv'), index=False)
+pd.DataFrame(stat_abl_table, columns=headers_abl_stat).to_csv(os.path.join(DIR_ABLACIJA_DRIVE, 'ablacija_1po1_statistika.csv'), index=False)
 
 
-# -------------------------------------------------------------
-# GENERISANJE I ČUVANJE 6 GRAFIKA ZA ABLACIJU
-# -------------------------------------------------------------
+# =============================================================
+# 2. KOMBINATORNA ABLACIJA KRITIČNIH MODULA (Po 2, Sva 4, Samo 4, Barebones)
+# =============================================================
+crit_components = [
+    ("Spectral", "use_spectral"),
+    ("EdgeBranch", "use_edge_branch"),
+    ("CCR", "use_ccr"),
+    ("SkipRefine", "use_skip_refine")
+]
+crit_keys = [k for _, k in crit_components]
+
+pairwise_configs = [
+    ("Full Proposed Model", dict()),
+    ("w/o All 4 Critical [Spectral+Edge+CCR+SkipRefine]", {k: False for k in crit_keys}),
+    ("w/o [Spectral + EdgeBranch]", {"use_spectral": False, "use_edge_branch": False}),
+    ("w/o [Spectral + CCR]", {"use_spectral": False, "use_ccr": False}),
+    ("w/o [Spectral + SkipRefine]", {"use_spectral": False, "use_skip_refine": False}),
+    ("w/o [EdgeBranch + CCR]", {"use_edge_branch": False, "use_ccr": False}),
+    ("w/o [EdgeBranch + SkipRefine]", {"use_edge_branch": False, "use_skip_refine": False}),
+    ("w/o [CCR + SkipRefine]", {"use_ccr": False, "use_skip_refine": False}),
+    ("Only 4 Critical Active (All Secondary OFF)", {
+        "use_spectral": True, "use_edge_branch": True, "use_ccr": True, "use_skip_refine": True,
+        "use_cross_bridge": False, "use_gated_fusion": False, "use_damage_attention": False,
+        "use_dilated_context": False, "use_gated_skips": False
+    }),
+    ("Barebones Backbone (All OFF)", {
+        "use_spectral": False, "use_edge_branch": False, "use_ccr": False, "use_skip_refine": False,
+        "use_cross_bridge": False, "use_gated_fusion": False, "use_damage_attention": False,
+        "use_dilated_context": False, "use_gated_skips": False
+    })
+]
+
+pairwise_data = {cfg_name: {'PSNR': [], 'SSIM': [], 'LPIPS': []} for cfg_name, _ in pairwise_configs}
+
+for naziv, cfg in pairwise_configs:
+    with torch.no_grad():
+        for fname in val_files:
+            c_p = os.path.join(DIR_VAL_CLEAN, fname)
+            d_p = os.path.join(DIR_VAL_DEGRADED, fname)
+            if not (os.path.exists(c_p) and os.path.exists(d_p)):
+                continue
+
+            c_img = cv2.resize(cv2.cvtColor(cv2.imread(c_p), cv2.COLOR_BGR2RGB), (IMG_SIZE, IMG_SIZE)).astype(np.float32) / 255.0
+            d_img = cv2.resize(cv2.cvtColor(cv2.imread(d_p), cv2.COLOR_BGR2RGB), (IMG_SIZE, IMG_SIZE)).astype(np.float32) / 255.0
+
+            d_t = torch.from_numpy(d_img).permute(2, 0, 1).unsqueeze(0).to(device)
+
+            out_t = torch.clamp(moj_model(d_t, **cfg), 0.0, 1.0)
+            out_np = (out_t.squeeze(0).cpu().numpy().transpose(1, 2, 0) * 255.0).round().astype(np.uint8).astype(np.float32) / 255.0
+            out_eval_t = torch.from_numpy(out_np).permute(2, 0, 1).unsqueeze(0).to(device) * 2.0 - 1.0
+            c_eval_t = torch.from_numpy(c_img).permute(2, 0, 1).unsqueeze(0).to(device) * 2.0 - 1.0
+
+            mse = np.mean((c_img - out_np) ** 2)
+            psnr_val = 10.0 * np.log10(1.0 / mse) if mse > 0 else 100.0
+            ssim_val = ssim_metric(c_img, out_np, channel_axis=2, data_range=1.0)
+            lpips_val = eval_lpips_fn(out_eval_t, c_eval_t).item()
+
+            pairwise_data[naziv]['PSNR'].append(psnr_val)
+            pairwise_data[naziv]['SSIM'].append(ssim_val)
+            pairwise_data[naziv]['LPIPS'].append(lpips_val)
+
+summary_pair = []
+for naziv, _ in pairwise_configs:
+    summary_pair.append([
+        naziv,
+        f"{np.mean(pairwise_data[naziv]['PSNR']):.2f}",
+        f"{np.mean(pairwise_data[naziv]['SSIM']):.4f}",
+        f"{np.mean(pairwise_data[naziv]['LPIPS']):.4f}"
+    ])
+headers_pair_mean = ['Konfiguracija Modela (Kombinatorna)', 'PSNR (dB) [↑]', 'SSIM [↑]', 'LPIPS [↓]']
+
+stat_pair_table = []
+for naziv, _ in pairwise_configs:
+    if naziv == "Full Proposed Model":
+        continue
+
+    var_p = np.array(pairwise_data[naziv]['PSNR'])
+    var_s = np.array(pairwise_data[naziv]['SSIM'])
+    var_l = np.array(pairwise_data[naziv]['LPIPS'])
+
+    diff_p = full_p - var_p
+    _, p_w_p = stats.wilcoxon(full_p, var_p)
+    _, p_t_p = stats.ttest_rel(full_p, var_p)
+    d_p = np.mean(diff_p) / np.std(diff_p, ddof=1) if np.std(diff_p, ddof=1) > 0 else 0.0
+
+    _, p_w_s = stats.wilcoxon(full_s, var_s)
+    _, p_w_l = stats.wilcoxon(full_l, var_l)
+
+    stat_pair_table.append([
+        naziv,
+        f"-{np.mean(diff_p):.2f} dB",
+        format_p_val(p_w_p),
+        format_p_val(p_t_p),
+        f"{d_p:.2f}",
+        format_p_val(p_w_s),
+        format_p_val(p_w_l)
+    ])
+
+headers_pair_stat = ['Uklonjena Komponenta', 'Δ PSNR', 'Wilcoxon (PSNR)', 't-test (PSNR)', "Cohen's d", 'Wilcoxon (SSIM)', 'Wilcoxon (LPIPS)']
+
+pd.DataFrame(summary_pair, columns=headers_pair_mean).to_csv(os.path.join(DIR_ABLACIJA_DRIVE, 'ablacija_kombinatorna_metrike.csv'), index=False)
+pd.DataFrame(stat_pair_table, columns=headers_pair_stat).to_csv(os.path.join(DIR_ABLACIJA_DRIVE, 'ablacija_kombinatorna_statistika.csv'), index=False)
+
+
+# =============================================================
+# 3. GENERISANJE I ČUVANJE 6 GRAFIKA
+# =============================================================
 plt.style.use('seaborn-v0_8-whitegrid' if 'seaborn-v0_8-whitegrid' in plt.style.available else 'default')
-cfg_names = [c[0] for c in ablation_configs]
+cfg_names = [c[0] for c in pairwise_configs]
 short_labels = [
     "Full Model", "w/o All 4", "w/o [Spec+Edge]", "w/o [Spec+CCR]",
     "w/o [Spec+Skip]", "w/o [Edge+CCR]", "w/o [Edge+Skip]", "w/o [CCR+Skip]",
     "Only 4 Active", "Barebones"
 ]
 
-mean_psnrs = [np.mean(raw_data[c]['PSNR']) for c in cfg_names]
-mean_ssims = [np.mean(raw_data[c]['SSIM']) for c in cfg_names]
-mean_lpips = [np.mean(raw_data[c]['LPIPS']) for c in cfg_names]
+mean_psnrs = [np.mean(pairwise_data[c]['PSNR']) for c in cfg_names]
+mean_ssims = [np.mean(pairwise_data[c]['SSIM']) for c in cfg_names]
+mean_lpips = [np.mean(pairwise_data[c]['LPIPS']) for c in cfg_names]
 
 # Grafik 1: PSNR Poređenje
 plt.figure(figsize=(12, 6))
@@ -925,7 +1014,7 @@ plt.show()
 
 # Grafik 4: Boxplot Distribucije PSNR-a
 plt.figure(figsize=(14, 7))
-psnr_dist = [raw_data[c]['PSNR'] for c in cfg_names]
+psnr_dist = [pairwise_data[c]['PSNR'] for c in cfg_names]
 plt.boxplot(psnr_dist, labels=short_labels, patch_artist=True, boxprops=dict(facecolor='#aec7e8', color='black'))
 plt.title('Grafik 4: Distribucija PSNR Vrednosti po Uzorcima (Boxplot)', fontsize=14, fontweight='bold')
 plt.ylabel('PSNR (dB)', fontsize=12)
@@ -936,7 +1025,7 @@ plt.show()
 
 # Grafik 5: Pad Performansi u odnosu na Full Model (Δ PSNR)
 plt.figure(figsize=(12, 6))
-deltas = [np.mean(full_p) - np.mean(raw_data[c]['PSNR']) for c in cfg_names[1:]]
+deltas = [np.mean(full_p) - np.mean(pairwise_data[c]['PSNR']) for c in cfg_names[1:]]
 bars = plt.bar(short_labels[1:], deltas, color='#ff7f0e', edgecolor='black')
 plt.title('Grafik 5: Pad Performansi u Odnosu na Full Model (Δ PSNR)', fontsize=14, fontweight='bold')
 plt.ylabel('Pad PSNR-a (dB)', fontsize=12)
@@ -951,7 +1040,7 @@ plt.show()
 plt.figure(figsize=(12, 6))
 cohen_vals = []
 for c in cfg_names[1:]:
-    diff = full_p - np.array(raw_data[c]['PSNR'])
+    diff = full_p - np.array(pairwise_data[c]['PSNR'])
     d = np.mean(diff) / np.std(diff, ddof=1) if np.std(diff, ddof=1) > 0 else 0.0
     cohen_vals.append(d)
 
@@ -973,12 +1062,22 @@ print("█" * 98)
 print(tabulate(tabela_direktna, headers=headers_direktna, tablefmt="fancy_grid", stralign="center", numalign="center"))
 
 print("\n" + "█" * 98)
-print(f"  ablacija (N = {len(val_files)})")
+print(f"  ablacija 1-po-1 blok (N = {len(val_files)})")
 print("█" * 98)
 print(tabulate(summary_abl, headers=headers_abl_mean, tablefmt="fancy_grid", stralign="center", numalign="center"))
 
 print("\n" + "█" * 98)
-print("  statisticki testic :3")
+print("  statisticki testic 1-po-1 :3")
 print("█" * 98)
 print(tabulate(stat_abl_table, headers=headers_abl_stat, tablefmt="fancy_grid", stralign="center", numalign="center"))
+
+print("\n" + "█" * 98)
+print(f"  kombinatorna ablacija kritičnih modula (N = {len(val_files)})")
+print("█" * 98)
+print(tabulate(summary_pair, headers=headers_pair_mean, tablefmt="fancy_grid", stralign="center", numalign="center"))
+
+print("\n" + "█" * 98)
+print("  statisticki testic kombinatorni :3")
+print("█" * 98)
+print(tabulate(stat_pair_table, headers=headers_pair_stat, tablefmt="fancy_grid", stralign="center", numalign="center"))
 print("\nLegenda statističke značajnosti: *** p < 0.001  |  ** p < 0.01  |  * p < 0.05  |  ns: nije značajno\n")
