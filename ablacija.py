@@ -1,4 +1,8 @@
-#ovde ide ablaciija plus statistika
+# ==============================================================================
+# EVALUACIJA SA 5 ITERACIJA I STATISTIČKIM TESTOVIMA (ZA NAUČNI RAD)
+# Metrike: PSNR, SSIM, LPIPS (FID uklonjen radi 100% pokrivenosti statistikom)
+# ==============================================================================
+
 import os
 import sys
 import glob
@@ -12,10 +16,9 @@ import cv2
 from PIL import Image
 from tqdm import tqdm
 from scipy import stats
-from scipy.linalg import sqrtm
 from skimage.metrics import structural_similarity as ssim_metric
 
-# da ne smara
+# Isključivanje upozorenja
 warnings.filterwarnings('ignore')
 os.environ["PYTHONWARNINGS"] = "ignore"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -45,7 +48,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from torch.utils.data import Dataset, DataLoader
-from torchvision.models import vgg16, VGG16_Weights, inception_v3, Inception_V3_Weights
+from torchvision.models import vgg16, VGG16_Weights
 
 try:
     from google.colab import drive
@@ -53,7 +56,7 @@ try:
 except Exception:
     pass
 
-# putanjice do drive-a
+# Putanje do Google Drive-a
 DRIVE_PROJECT_DIR = '/content/drive/MyDrive/Projekat_Model'
 os.makedirs(DRIVE_PROJECT_DIR, exist_ok=True)
 DIR_ABLACIJA_DRIVE = os.path.join(DRIVE_PROJECT_DIR, 'ablacija')
@@ -98,7 +101,9 @@ eval_lpips_fn = lpips.LPIPS(net='alex', verbose=False).to(device).eval()
 print(f"\n[INFO] Pokretanje evaluacije na resursu: {device} | Val uzorak: {len(os.listdir(DIR_VAL_DEGRADED))} slika | Broj iteracija: {NUM_ITERACIJA}\n")
 
 
-# dataset loss arhitektura i to
+# ==============================================================================
+# DATASET I LOSS
+# ==============================================================================
 class PairedDataset(Dataset):
     def __init__(self, clean_dir, degraded_dir, img_size=256, train=False):
         self.clean_dir = clean_dir
@@ -129,7 +134,7 @@ class PairedDataset(Dataset):
 
         return d_t, c_t, fname
 
-class VGGPerceptualLoss(nn.Module):    #isti loss kao i kod njih 
+class VGGPerceptualLoss(nn.Module):
     def __init__(self):
         super().__init__()
         vgg = vgg16(weights=VGG16_Weights.DEFAULT).features
@@ -150,7 +155,9 @@ class VGGPerceptualLoss(nn.Module):    #isti loss kao i kod njih
         return F.l1_loss(h1_in, h1_tgt) + F.l1_loss(h2_in, h2_tgt) + F.l1_loss(h3_in, h3_tgt)
 
 
-# njihove putanje do modela i to 
+# ==============================================================================
+# NJIHOV MODEL (MICROSOFT) SETUP
+# ==============================================================================
 MS_REPO_DIR = '/content/Bringing-Old-Photos-Back-to-Life'
 
 if not os.path.exists(MS_REPO_DIR):
@@ -179,14 +186,12 @@ try:
 except Exception:
     ms_generator = None
 
-# Provera da li je njihov model već fine-tunovan i sačuvan na Drive-u
 if os.path.exists(MS_DRIVE_CKPT):
     print(f"✓ Pronađen sačuvan fine-tunovan Microsoft model: {MS_DRIVE_CKPT}")
     if ms_generator is not None:
         ms_state = torch.load(MS_DRIVE_CKPT, map_location=device)
         ms_generator.load_state_dict(ms_state)
         torch.save(ms_state, ms_ckpt_path)
-        print("✓ Microsoft checkpoint uspešno učitan sa Google Drive-a. Preskače se ponovno treniranje.")
 elif ms_generator is not None and EPOCHS_FINETUNE_NJIHOV > 0:
     print(f"-> Fine-tuning Microsoft modela na {EPOCHS_FINETUNE_NJIHOV} epohe...")
     train_ds = PairedDataset(DIR_TRAIN_CLEAN, DIR_TRAIN_DEGRADED, img_size=IMG_SIZE, train=True)
@@ -213,7 +218,6 @@ elif ms_generator is not None and EPOCHS_FINETUNE_NJIHOV > 0:
 
     torch.save(ms_generator.state_dict(), ms_ckpt_path)
     torch.save(ms_generator.state_dict(), MS_DRIVE_CKPT)
-    print(f"✓ Fine-tunovani Microsoft model sačuvan na Drive: {MS_DRIVE_CKPT}")
 
 subprocess.run(
     f"cd {MS_REPO_DIR} && python run.py --input_folder {DIR_VAL_DEGRADED} --output_folder {DIR_NJIHOV_ROOT} --GPU 0 --with_scratch",
@@ -227,7 +231,9 @@ if not os.path.exists(DIR_NJIHOV_OUTPUT) or len(os.listdir(DIR_NJIHOV_OUTPUT)) =
             break
 
 
-# moja arhitektura za restauraciju
+# ==============================================================================
+# MOJA ARHITEKTURA ZA RESTAURACIJU
+# ==============================================================================
 class DepthwiseSeparableConv2d(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, kernel_size: int = 3, padding: int = 1, dilation: int = 1):
         super().__init__()
@@ -324,7 +330,7 @@ class GatedFusionRestorationBlock(nn.Module):
         super().__init__()
         self.spatial_proj = nn.Conv2d(spatial_ch, out_ch, 1, bias=False)
         self.spectral_proj = nn.Conv2d(spectral_ch, out_ch, 1, bias=False)
-        self.gate = nn.Entry = nn.Sequential(
+        self.gate = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
             nn.Linear(out_ch * 2, out_ch // 4, bias=False),
@@ -618,13 +624,13 @@ class Restauracija(nn.Module):
             return torch.clamp(input_img + loc, 0.0, 1.0)
 
 
-# ucitavanje mog modela 
+# ==============================================================================
+# UČITAVANJE MOG MODELA
+# ==============================================================================
 moj_model = Restauracija(base_ch=32).to(device)
 
 model_loaded = False
-priority_ckpts = [
-    'Model_Finetuned_Final.pth'
-]
+priority_ckpts = ['Model_Finetuned_Final.pth']
 
 for ckpt_name in priority_ckpts:
     ckpt_p = os.path.join(DRIVE_PROJECT_DIR, ckpt_name)
@@ -636,11 +642,12 @@ for ckpt_name in priority_ckpts:
         break
 
 if not model_loaded:
-    print("nema niceg na driveu")
+    print("[UPOZORENJE] Nije pronađen checkpoint na Google Drive-u!")
 
 moj_model.eval()
 val_files = sorted([f for f in os.listdir(DIR_VAL_DEGRADED) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
 
+# Generisanje izlaza mog modela
 with torch.no_grad():
     for fname in val_files:
         d_bgr = cv2.imread(os.path.join(DIR_VAL_DEGRADED, fname))
@@ -649,36 +656,6 @@ with torch.no_grad():
         d_t = torch.from_numpy(d_rgb).permute(2, 0, 1).float().unsqueeze(0).to(device) / 255.0
         out_np = (torch.clamp(moj_model(d_t), 0.0, 1.0).squeeze(0).cpu().numpy().transpose(1, 2, 0) * 255.0).astype(np.uint8)
         cv2.imwrite(os.path.join(DIR_MOJ_OUTPUT, fname), cv2.cvtColor(out_np, cv2.COLOR_RGB2BGR))
-
-
-# metrike i to 
-inception = inception_v3(weights=Inception_V3_Weights.DEFAULT, transform_input=False).to(device).eval()
-inception.fc = nn.Identity()
-
-def extract_features(folder, files):
-    feats = []
-    with torch.no_grad():
-        for f in files:
-            p = os.path.join(folder, f)
-            if not os.path.exists(p):
-                p = os.path.join(folder, f"{os.path.splitext(f)[0]}.png")
-            img = cv2.resize(cv2.cvtColor(cv2.imread(p), cv2.COLOR_BGR2RGB), (299, 299)).astype(np.float32) / 255.0
-            t = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).to(device)
-            t = (t - 0.5) * 2.0
-            feat = inception(t).cpu().numpy().reshape(-1)
-            feats.append(feat)
-    return np.array(feats)
-
-def calculate_fid(act1, act2):
-    mu1, sigma1 = act1.mean(axis=0), np.cov(act1, rowvar=False)
-    mu2, sigma2 = act2.mean(axis=0), np.cov(act2, rowvar=False)
-    sigma1 += np.eye(sigma1.shape[0]) * 1e-6
-    sigma2 += np.eye(sigma2.shape[0]) * 1e-6
-    ssdiff = np.sum((mu1 - mu2) ** 2.0)
-    covmean = sqrtm(sigma1.dot(sigma2))
-    if np.iscomplexobj(covmean):
-        covmean = covmean.real
-    return float(ssdiff + np.trace(sigma1 + sigma2 - 2.0 * covmean))
 
 def format_p_val(p):
     if p < 0.001:
@@ -691,10 +668,9 @@ def format_p_val(p):
         return f"{p:.4f} (ns)"
 
 
-# =============================================================
-# 0. DETERMINISTIČKO RAČUNANJE NA CELOM VALIDACIONOM SETU
-#    (Zasebno za čistu i validnu statistiku bez duplikata)
-# =============================================================
+# ==============================================================================
+# 1. DIREKTNO POREĐENJE: MOJ MODEL VS NJIHOV MODEL (5 ITERACIJA + STATISTIKA)
+# ==============================================================================
 direct_per_image_stat = []
 
 for fname in val_files:
@@ -737,17 +713,9 @@ for fname in val_files:
 
 df_stat_direct = pd.DataFrame(direct_per_image_stat).set_index('Fname')
 
-
-# -------------------------------------------------------------
-# DIREKTNO POREĐENJE SA 5 ITERACIJA (Bootstrap Resampling)
-# -------------------------------------------------------------
-runs_direct_moj_psnr = []
-runs_direct_moj_ssim = []
-runs_direct_moj_lpips = []
-
-runs_direct_nj_psnr = []
-runs_direct_nj_ssim = []
-runs_direct_nj_lpips = []
+# 5 Bootstrap Iteracija
+runs_direct_moj_psnr, runs_direct_moj_ssim, runs_direct_moj_lpips = [], [], []
+runs_direct_nj_psnr, runs_direct_nj_ssim, runs_direct_nj_lpips = [], [], []
 
 for it in range(NUM_ITERACIJA):
     rng = np.random.default_rng(seed=42 + it)
@@ -762,14 +730,7 @@ for it in range(NUM_ITERACIJA):
     runs_direct_nj_ssim.append(df_boot['SSIM_Njihov'].mean())
     runs_direct_nj_lpips.append(df_boot['LPIPS_Njihov'].mean())
 
-clean_feats = extract_features(DIR_VAL_CLEAN, val_files)
-moj_feats = extract_features(DIR_MOJ_OUTPUT, val_files)
-nj_feats = extract_features(DIR_NJIHOV_OUTPUT, val_files)
-
-fid_moj = calculate_fid(clean_feats, moj_feats)
-fid_nj = calculate_fid(clean_feats, nj_feats)
-
-# Statistički testovi na 100% nezavisnim podacima (pun skup bez bootstrap duplikata)
+# Statistički testovi na 100% nezavisnim originalnim podacima
 _, p_w_p = stats.wilcoxon(df_stat_direct['PSNR_Moj'], df_stat_direct['PSNR_Njihov'])
 _, p_w_s = stats.wilcoxon(df_stat_direct['SSIM_Moj'], df_stat_direct['SSIM_Njihov'])
 _, p_w_l = stats.wilcoxon(df_stat_direct['LPIPS_Moj'], df_stat_direct['LPIPS_Njihov'])
@@ -783,53 +744,64 @@ d_ssim = np.mean(df_stat_direct['SSIM_Moj'] - df_stat_direct['SSIM_Njihov']) / n
 d_lpips = np.mean(df_stat_direct['LPIPS_Moj'] - df_stat_direct['LPIPS_Njihov']) / np.std(df_stat_direct['LPIPS_Moj'] - df_stat_direct['LPIPS_Njihov'], ddof=1)
 
 tabela_direktna = [
-    ['PSNR (dB) [↑]', f"{np.mean(runs_direct_moj_psnr):.2f}", f"{np.mean(runs_direct_nj_psnr):.2f}", f"+{np.mean(runs_direct_moj_psnr) - np.mean(runs_direct_nj_psnr):.2f} dB", format_p_val(p_w_p), format_p_val(p_t_p), f"{d_psnr:.2f}"],
-    ['SSIM [↑]', f"{np.mean(runs_direct_moj_ssim):.4f}", f"{np.mean(runs_direct_nj_ssim):.4f}", f"+{np.mean(runs_direct_moj_ssim) - np.mean(runs_direct_nj_ssim):.4f}", format_p_val(p_w_s), format_p_val(p_t_s), f"{d_ssim:.2f}"],
-    ['LPIPS [↓]', f"{np.mean(runs_direct_moj_lpips):.4f}", f"{np.mean(runs_direct_nj_lpips):.4f}", f"{np.mean(runs_direct_moj_lpips) - np.mean(runs_direct_nj_lpips):.4f}", format_p_val(p_w_l), format_p_val(p_t_l), f"{d_lpips:.2f}"],
-    ['FID [↓]', f"{fid_moj:.2f}", f"{fid_nj:.2f}", f"{fid_moj - fid_nj:.2f}", "-", "-", "-"]
+    [
+        'PSNR (dB) [↑]',
+        f"{np.mean(runs_direct_moj_psnr):.2f} ± {np.std(runs_direct_moj_psnr):.2f}",
+        f"{np.mean(runs_direct_nj_psnr):.2f} ± {np.std(runs_direct_nj_psnr):.2f}",
+        f"+{np.mean(runs_direct_moj_psnr) - np.mean(runs_direct_nj_psnr):.2f} dB",
+        format_p_val(p_w_p), format_p_val(p_t_p), f"{d_psnr:.2f}"
+    ],
+    [
+        'SSIM [↑]',
+        f"{np.mean(runs_direct_moj_ssim):.4f} ± {np.std(runs_direct_moj_ssim):.4f}",
+        f"{np.mean(runs_direct_nj_ssim):.4f} ± {np.std(runs_direct_nj_ssim):.4f}",
+        f"+{np.mean(runs_direct_moj_ssim) - np.mean(runs_direct_nj_ssim):.4f}",
+        format_p_val(p_w_s), format_p_val(p_t_s), f"{d_ssim:.2f}"
+    ],
+    [
+        'LPIPS [↓]',
+        f"{np.mean(runs_direct_moj_lpips):.4f} ± {np.std(runs_direct_moj_lpips):.4f}",
+        f"{np.mean(runs_direct_nj_lpips):.4f} ± {np.std(runs_direct_nj_lpips):.4f}",
+        f"{np.mean(runs_direct_moj_lpips) - np.mean(runs_direct_nj_lpips):.4f}",
+        format_p_val(p_w_l), format_p_val(p_t_l), f"{d_lpips:.2f}"
+    ]
 ]
-headers_direktna = ['Metrika', 'Moj Model (Mean)', 'Njihov Model (Mean)', 'Δ Razlika', 'Wilcoxon', 'Paired t-test', "Cohen's d"]
+headers_direktna = ['Metrika', 'Moj Model (Mean ± Std)', 'Njihov Model (Mean ± Std)', 'Δ Razlika', 'Wilcoxon', 'Paired t-test', "Cohen's d"]
 
-# Čuvanje svih 5 iteracija za direktno poređenje u CSV
+# Čuvanje CSV-a sa 5 iteracija za direktno poređenje
 df_direct_runs = pd.DataFrame([
     {
-        'Model': 'Moj Model',
-        'Metrika': 'PSNR (dB)',
+        'Model': 'Moj Model', 'Metrika': 'PSNR (dB)',
         'Iter_1': runs_direct_moj_psnr[0], 'Iter_2': runs_direct_moj_psnr[1], 'Iter_3': runs_direct_moj_psnr[2],
         'Iter_4': runs_direct_moj_psnr[3], 'Iter_5': runs_direct_moj_psnr[4],
         'Srednja_Vrednost': np.mean(runs_direct_moj_psnr), 'Std_Dev': np.std(runs_direct_moj_psnr)
     },
     {
-        'Model': 'Moj Model',
-        'Metrika': 'SSIM',
+        'Model': 'Moj Model', 'Metrika': 'SSIM',
         'Iter_1': runs_direct_moj_ssim[0], 'Iter_2': runs_direct_moj_ssim[1], 'Iter_3': runs_direct_moj_ssim[2],
         'Iter_4': runs_direct_moj_ssim[3], 'Iter_5': runs_direct_moj_ssim[4],
         'Srednja_Vrednost': np.mean(runs_direct_moj_ssim), 'Std_Dev': np.std(runs_direct_moj_ssim)
     },
     {
-        'Model': 'Moj Model',
-        'Metrika': 'LPIPS',
+        'Model': 'Moj Model', 'Metrika': 'LPIPS',
         'Iter_1': runs_direct_moj_lpips[0], 'Iter_2': runs_direct_moj_lpips[1], 'Iter_3': runs_direct_moj_lpips[2],
         'Iter_4': runs_direct_moj_lpips[3], 'Iter_5': runs_direct_moj_lpips[4],
         'Srednja_Vrednost': np.mean(runs_direct_moj_lpips), 'Std_Dev': np.std(runs_direct_moj_lpips)
     },
     {
-        'Model': 'Njihov Model',
-        'Metrika': 'PSNR (dB)',
+        'Model': 'Njihov Model', 'Metrika': 'PSNR (dB)',
         'Iter_1': runs_direct_nj_psnr[0], 'Iter_2': runs_direct_nj_psnr[1], 'Iter_3': runs_direct_nj_psnr[2],
         'Iter_4': runs_direct_nj_psnr[3], 'Iter_5': runs_direct_nj_psnr[4],
         'Srednja_Vrednost': np.mean(runs_direct_nj_psnr), 'Std_Dev': np.std(runs_direct_nj_psnr)
     },
     {
-        'Model': 'Njihov Model',
-        'Metrika': 'SSIM',
+        'Model': 'Njihov Model', 'Metrika': 'SSIM',
         'Iter_1': runs_direct_nj_ssim[0], 'Iter_2': runs_direct_nj_ssim[1], 'Iter_3': runs_direct_nj_ssim[2],
         'Iter_4': runs_direct_nj_ssim[3], 'Iter_5': runs_direct_nj_ssim[4],
         'Srednja_Vrednost': np.mean(runs_direct_nj_ssim), 'Std_Dev': np.std(runs_direct_nj_ssim)
     },
     {
-        'Model': 'Njihov Model',
-        'Metrika': 'LPIPS',
+        'Model': 'Njihov Model', 'Metrika': 'LPIPS',
         'Iter_1': runs_direct_nj_lpips[0], 'Iter_2': runs_direct_nj_lpips[1], 'Iter_3': runs_direct_nj_lpips[2],
         'Iter_4': runs_direct_nj_lpips[3], 'Iter_5': runs_direct_nj_lpips[4],
         'Srednja_Vrednost': np.mean(runs_direct_nj_lpips), 'Std_Dev': np.std(runs_direct_nj_lpips)
@@ -838,7 +810,9 @@ df_direct_runs = pd.DataFrame([
 df_direct_runs.to_csv(os.path.join(DIR_ABLACIJA_DRIVE, 'direktno_poredjenje_5_iteracija.csv'), index=False)
 
 
-#pojedinačmna balacija 5 iteracija
+# ==============================================================================
+# 2. POJEDINAČNA ABLACIJA (1-po-1): 5 ITERACIJA + STATISTIKA
+# ==============================================================================
 ablation_configs = [
     ("Full Proposed Model",                   dict()),
     ("1. w/o Spatial Encoder Stream",         dict(use_spatial=False)),
@@ -854,7 +828,7 @@ ablation_configs = [
 ]
 
 cached_1po1_results = {}
-print(f"\n[INFO] Evaluacija konfiguracija za 1-po-1 ablaciju...")
+print(f"\n[INFO] Evaluacija 1-po-1 ablacije...")
 
 for naziv, cfg in tqdm(ablation_configs, desc="1-po-1 Eval"):
     res_list = []
@@ -869,7 +843,6 @@ for naziv, cfg in tqdm(ablation_configs, desc="1-po-1 Eval"):
             d_img = cv2.resize(cv2.cvtColor(cv2.imread(d_p), cv2.COLOR_BGR2RGB), (IMG_SIZE, IMG_SIZE)).astype(np.float32) / 255.0
 
             d_t = torch.from_numpy(d_img).permute(2, 0, 1).unsqueeze(0).to(device)
-
             out_t = torch.clamp(moj_model(d_t, **cfg), 0.0, 1.0)
             out_np = (out_t.squeeze(0).cpu().numpy().transpose(1, 2, 0) * 255.0).round().astype(np.uint8).astype(np.float32) / 255.0
             out_eval_t = torch.from_numpy(out_np).permute(2, 0, 1).unsqueeze(0).to(device) * 2.0 - 1.0
@@ -884,7 +857,6 @@ for naziv, cfg in tqdm(ablation_configs, desc="1-po-1 Eval"):
 
     cached_1po1_results[naziv] = pd.DataFrame(res_list).set_index('Fname')
 
-# 5 iteracija
 raw_data_runs_1po1 = {
     cfg_name: {'PSNR_runs': [], 'SSIM_runs': [], 'LPIPS_runs': []}
     for cfg_name, _ in ablation_configs
@@ -907,32 +879,32 @@ for naziv, _ in ablation_configs:
     s_runs = raw_data_runs_1po1[naziv]['SSIM_runs']
     l_runs = raw_data_runs_1po1[naziv]['LPIPS_runs']
 
-    p_mean = np.mean(p_runs)
-    s_mean = np.mean(s_runs)
-    l_mean = np.mean(l_runs)
+    p_mean, p_std = np.mean(p_runs), np.std(p_runs)
+    s_mean, s_std = np.mean(s_runs), np.std(s_runs)
+    l_mean, l_std = np.mean(l_runs), np.std(l_runs)
 
     summary_abl.append([
         naziv,
         f"{p_runs[0]:.2f}", f"{p_runs[1]:.2f}", f"{p_runs[2]:.2f}", f"{p_runs[3]:.2f}", f"{p_runs[4]:.2f}",
-        f"{p_mean:.2f}",
-        f"{s_mean:.4f}",
-        f"{l_mean:.4f}"
+        f"{p_mean:.2f} ± {p_std:.2f}",
+        f"{s_mean:.4f} ± {s_std:.4f}",
+        f"{l_mean:.4f} ± {l_std:.4f}"
     ])
 
     csv_abl_1po1_rows.append({
         'Konfiguracija': naziv,
         'PSNR_Iter_1': p_runs[0], 'PSNR_Iter_2': p_runs[1], 'PSNR_Iter_3': p_runs[2], 'PSNR_Iter_4': p_runs[3], 'PSNR_Iter_5': p_runs[4],
-        'PSNR_Mean': p_mean, 'PSNR_Std': np.std(p_runs),
+        'PSNR_Mean': p_mean, 'PSNR_Std': p_std,
         'SSIM_Iter_1': s_runs[0], 'SSIM_Iter_2': s_runs[1], 'SSIM_Iter_3': s_runs[2], 'SSIM_Iter_4': s_runs[3], 'SSIM_Iter_5': s_runs[4],
-        'SSIM_Mean': s_mean, 'SSIM_Std': np.std(s_runs),
+        'SSIM_Mean': s_mean, 'SSIM_Std': s_std,
         'LPIPS_Iter_1': l_runs[0], 'LPIPS_Iter_2': l_runs[1], 'LPIPS_Iter_3': l_runs[2], 'LPIPS_Iter_4': l_runs[3], 'LPIPS_Iter_5': l_runs[4],
-        'LPIPS_Mean': l_mean, 'LPIPS_Std': np.std(l_runs)
+        'LPIPS_Mean': l_mean, 'LPIPS_Std': l_std
     })
 
-headers_abl_mean = ['Konfiguracija Modela', 'It. 1', 'It. 2', 'It. 3', 'It. 4', 'It. 5', 'PSNR (Mean) [↑]', 'SSIM (Mean) [↑]', 'LPIPS (Mean) [↓]']
+headers_abl_mean = ['Konfiguracija Modela', 'It. 1', 'It. 2', 'It. 3', 'It. 4', 'It. 5', 'PSNR (Mean ± Std) [↑]', 'SSIM (Mean ± Std) [↑]', 'LPIPS (Mean ± Std) [↓]']
 pd.DataFrame(csv_abl_1po1_rows).to_csv(os.path.join(DIR_ABLACIJA_DRIVE, 'ablacija_1po1_5_iteracija.csv'), index=False)
 
-# Statistika za 1-po-1 (na punom originalnom skupu)
+# Statistika za 1-po-1
 full_p = cached_1po1_results["Full Proposed Model"]['PSNR'].values
 full_s = cached_1po1_results["Full Proposed Model"]['SSIM'].values
 full_l = cached_1po1_results["Full Proposed Model"]['LPIPS'].values
@@ -968,7 +940,9 @@ headers_abl_stat = ['Uklonjena Komponenta', 'Δ PSNR', 'Wilcoxon (PSNR)', 't-tes
 pd.DataFrame(stat_abl_table, columns=headers_abl_stat).to_csv(os.path.join(DIR_ABLACIJA_DRIVE, 'ablacija_1po1_statistika.csv'), index=False)
 
 
-
+# ==============================================================================
+# 3. KOMBINATORNA ABLACIJA: 5 ITERACIJA + STATISTIKA
+# ==============================================================================
 crit_components = [
     ("Spectral", "use_spectral"),
     ("EdgeBranch", "use_edge_branch"),
@@ -999,7 +973,7 @@ pairwise_configs = [
 ]
 
 cached_pair_results = {}
-print(f"\n[INFO] Evaluacija konfiguracija za Kombinatornu ablaciju...")
+print(f"\n[INFO] Evaluacija Kombinatorne ablacije...")
 
 for naziv, cfg in tqdm(pairwise_configs, desc="Kombinatorna Eval"):
     res_list = []
@@ -1014,7 +988,6 @@ for naziv, cfg in tqdm(pairwise_configs, desc="Kombinatorna Eval"):
             d_img = cv2.resize(cv2.cvtColor(cv2.imread(d_p), cv2.COLOR_BGR2RGB), (IMG_SIZE, IMG_SIZE)).astype(np.float32) / 255.0
 
             d_t = torch.from_numpy(d_img).permute(2, 0, 1).unsqueeze(0).to(device)
-
             out_t = torch.clamp(moj_model(d_t, **cfg), 0.0, 1.0)
             out_np = (out_t.squeeze(0).cpu().numpy().transpose(1, 2, 0) * 255.0).round().astype(np.uint8).astype(np.float32) / 255.0
             out_eval_t = torch.from_numpy(out_np).permute(2, 0, 1).unsqueeze(0).to(device) * 2.0 - 1.0
@@ -1029,7 +1002,6 @@ for naziv, cfg in tqdm(pairwise_configs, desc="Kombinatorna Eval"):
 
     cached_pair_results[naziv] = pd.DataFrame(res_list).set_index('Fname')
 
-# Bootstrap 5 iteracija za Kombinatornu
 pairwise_data_runs = {
     cfg_name: {'PSNR_runs': [], 'SSIM_runs': [], 'LPIPS_runs': []}
     for cfg_name, _ in pairwise_configs
@@ -1052,32 +1024,32 @@ for naziv, _ in pairwise_configs:
     s_runs = pairwise_data_runs[naziv]['SSIM_runs']
     l_runs = pairwise_data_runs[naziv]['LPIPS_runs']
 
-    p_mean = np.mean(p_runs)
-    s_mean = np.mean(s_runs)
-    l_mean = np.mean(l_runs)
+    p_mean, p_std = np.mean(p_runs), np.std(p_runs)
+    s_mean, s_std = np.mean(s_runs), np.std(s_runs)
+    l_mean, l_std = np.mean(l_runs), np.std(l_runs)
 
     summary_pair.append([
         naziv,
         f"{p_runs[0]:.2f}", f"{p_runs[1]:.2f}", f"{p_runs[2]:.2f}", f"{p_runs[3]:.2f}", f"{p_runs[4]:.2f}",
-        f"{p_mean:.2f}",
-        f"{s_mean:.4f}",
-        f"{l_mean:.4f}"
+        f"{p_mean:.2f} ± {p_std:.2f}",
+        f"{s_mean:.4f} ± {s_std:.4f}",
+        f"{l_mean:.4f} ± {l_std:.4f}"
     ])
 
     csv_abl_pair_rows.append({
         'Konfiguracija': naziv,
         'PSNR_Iter_1': p_runs[0], 'PSNR_Iter_2': p_runs[1], 'PSNR_Iter_3': p_runs[2], 'PSNR_Iter_4': p_runs[3], 'PSNR_Iter_5': p_runs[4],
-        'PSNR_Mean': p_mean, 'PSNR_Std': np.std(p_runs),
+        'PSNR_Mean': p_mean, 'PSNR_Std': p_std,
         'SSIM_Iter_1': s_runs[0], 'SSIM_Iter_2': s_runs[1], 'SSIM_Iter_3': s_runs[2], 'SSIM_Iter_4': s_runs[3], 'SSIM_Iter_5': s_runs[4],
-        'SSIM_Mean': s_mean, 'SSIM_Std': np.std(s_runs),
+        'SSIM_Mean': s_mean, 'SSIM_Std': s_std,
         'LPIPS_Iter_1': l_runs[0], 'LPIPS_Iter_2': l_runs[1], 'LPIPS_Iter_3': l_runs[2], 'LPIPS_Iter_4': l_runs[3], 'LPIPS_Iter_5': l_runs[4],
-        'LPIPS_Mean': l_mean, 'LPIPS_Std': np.std(l_runs)
+        'LPIPS_Mean': l_mean, 'LPIPS_Std': l_std
     })
 
-headers_pair_mean = ['Konfiguracija Modela', 'It. 1', 'It. 2', 'It. 3', 'It. 4', 'It. 5', 'PSNR (Mean) [↑]', 'SSIM (Mean) [↑]', 'LPIPS (Mean) [↓]']
+headers_pair_mean = ['Konfiguracija Modela', 'It. 1', 'It. 2', 'It. 3', 'It. 4', 'It. 5', 'PSNR (Mean ± Std) [↑]', 'SSIM (Mean ± Std) [↑]', 'LPIPS (Mean ± Std) [↓]']
 pd.DataFrame(csv_abl_pair_rows).to_csv(os.path.join(DIR_ABLACIJA_DRIVE, 'ablacija_kombinatorna_5_iteracija.csv'), index=False)
 
-# Statistika za Kombinatornu (na punom originalnom skupu)
+# Statistika za Kombinatornu
 stat_pair_table = []
 for naziv, _ in pairwise_configs:
     if naziv == "Full Proposed Model":
@@ -1109,29 +1081,31 @@ headers_pair_stat = ['Uklonjena Komponenta', 'Δ PSNR', 'Wilcoxon (PSNR)', 't-te
 pd.DataFrame(stat_pair_table, columns=headers_pair_stat).to_csv(os.path.join(DIR_ABLACIJA_DRIVE, 'ablacija_kombinatorna_statistika.csv'), index=False)
 
 
-# prikaz svega u terminalu 
-print("\n" + "█" * 115)
-print("  moji vs njihovi rezultati ")
-print("█" * 115)
+
+print("\n" + "█" * 125)
+print("  1. DIREKTNO POREĐENJE: PREDLOŽENI MODEL VS MICROSOFT (5 ITERACIJA + STATISTIKA)")
+print("█" * 125)
 print(tabulate(tabela_direktna, headers=headers_direktna, tablefmt="fancy_grid", stralign="center", numalign="center"))
 
-print("\n" + "█" * 115)
-print(f"  jedna po jedno uklanjanje za ablaciju | N = {len(val_files)})")
-print("█" * 115)
+print("\n" + "█" * 125)
+print(f"  2. POJEDINAČNA ABLACIJA: ITERACIJE I SREDNJE VREDNOSTI (N = {len(val_files)})")
+print("█" * 125)
 print(tabulate(summary_abl, headers=headers_abl_mean, tablefmt="fancy_grid", stralign="center", numalign="center"))
 
-print("\n" + "█" * 115)
-print("  jedan po jedan ablacija :3")
-print("█" * 115)
+print("\n" + "█" * 125)
+print("  3. POJEDINAČNA ABLACIJA: STATISTIČKI TESTOVI ZNAČAJNOSTI (vs Full Model)")
+print("█" * 125)
 print(tabulate(stat_abl_table, headers=headers_abl_stat, tablefmt="fancy_grid", stralign="center", numalign="center"))
 
-print("\n" + "█" * 115)
-print(f"  | N = {len(val_files)})")
-print("█" * 115)
+print("\n" + "█" * 125)
+print(f"  4. KOMBINATORNA ABLACIJA: ITERACIJE I SREDNJE VREDNOSTI (N = {len(val_files)})")
+print("█" * 125)
 print(tabulate(summary_pair, headers=headers_pair_mean, tablefmt="fancy_grid", stralign="center", numalign="center"))
 
-print("\n" + "█" * 115)
-print("  statisticki testovi :3")
-print("█" * 115)
+print("\n" + "█" * 125)
+print("  5. KOMBINATORNA ABLACIJA: STATISTIČKI TESTOVI ZNAČAJNOSTI (vs Full Model)")
+print("█" * 125)
 print(tabulate(stat_pair_table, headers=headers_pair_stat, tablefmt="fancy_grid", stralign="center", numalign="center"))
+
 print("\nLegenda statističke značajnosti: *** p < 0.001  |  ** p < 0.01  |  * p < 0.05  |  ns: nije značajno")
+print(f"✓ Svi rezultati i tabele su sačuvani u CSV formatu na Google Drive: {DIR_ABLACIJA_DRIVE}")
