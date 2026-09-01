@@ -62,7 +62,7 @@ os.makedirs(DRIVE_PROJECT_DIR, exist_ok=True)
 DIR_ABLACIJA_DRIVE = os.path.join(DRIVE_PROJECT_DIR, 'ablacija')
 os.makedirs(DIR_ABLACIJA_DRIVE, exist_ok=True)
 
-EPOCHS_FINETUNE_NJIHOV = 3
+EPOCHS_FINETUNE_NJIHOV = 5
 BATCH_SIZE = 4
 LR_NJIHOV = 1e-4
 IMG_SIZE = 256
