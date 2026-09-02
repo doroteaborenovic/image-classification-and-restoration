@@ -1,12 +1,14 @@
 # ==============================================================================
-# EVALUACIJA SA 5 ITERACIJA I STATISTIČKIM TESTOVIMA (ZA NAUČNI RAD)
-# Prikaz: Čiste srednje vrednosti (Mean) bez ± simbola
+# NAUČNO METODOLOŠKA EVALUACIJA I ABLACIJA SA 5-EPOHNOM ADAPTACIJOM
+# Bootstrap: 1000 iteracija | 95% CI | Ulazni Baseline (K1) | Holm-Bonferroni (M4)
 # ==============================================================================
 
 import os
 import sys
 import glob
+import copy
 import random
+import re
 import warnings
 import subprocess
 import itertools
@@ -18,17 +20,19 @@ from tqdm import tqdm
 from scipy import stats
 from skimage.metrics import structural_similarity as ssim_metric
 
-# Isključivanje upozorenja
+# Isključivanje nepotrebnih upozorenja
 warnings.filterwarnings('ignore')
 os.environ["PYTHONWARNINGS"] = "ignore"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
-random.seed(42)
-np.random.seed(42)
+# Fiksiranje seed-ova za punu reproducibilnost
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
 import torch
-torch.manual_seed(42)
+torch.manual_seed(SEED)
 if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(42)
+    torch.cuda.manual_seed_all(SEED)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
@@ -59,15 +63,17 @@ except Exception:
 # Putanje do Google Drive-a
 DRIVE_PROJECT_DIR = '/content/drive/MyDrive/Projekat_Model'
 os.makedirs(DRIVE_PROJECT_DIR, exist_ok=True)
-DIR_ABLACIJA_DRIVE = os.path.join(DRIVE_PROJECT_DIR, 'ablacija')
+DIR_ABLACIJA_DRIVE = os.path.join(DRIVE_PROJECT_DIR, 'ablacija_checkpoints')
 os.makedirs(DIR_ABLACIJA_DRIVE, exist_ok=True)
 
-# PODEŠAVANJE NA 5 EPOHA
+# HIPERPARAMETRI
+EPOCHS_FINETUNE_ABLATION = 5
 EPOCHS_FINETUNE_NJIHOV = 5
 BATCH_SIZE = 4
+LR_ABLATION = 5e-5
 LR_NJIHOV = 1e-4
 IMG_SIZE = 256
-NUM_ITERACIJA = 5
+NUM_ITERACIJA = 1000  # Bootstrap preuzorkovanje za 95% CI
 
 def pronadji_foldere(tip="VALIDACIJA"):
     moguce = [
@@ -89,17 +95,11 @@ def pronadji_foldere(tip="VALIDACIJA"):
 DIR_TRAIN_CLEAN, DIR_TRAIN_DEGRADED, TRAIN_BASE = pronadji_foldere("TRENING")
 DIR_VAL_CLEAN, DIR_VAL_DEGRADED, VAL_BASE = pronadji_foldere("VALIDACIJA")
 
-DIR_MOJ_OUTPUT = '/content/rezultati_moj_model'
-DIR_NJIHOV_ROOT = '/content/rezultati_njihov_model'
-DIR_NJIHOV_OUTPUT = os.path.join(DIR_NJIHOV_ROOT, 'final_output')
-
-os.makedirs(DIR_MOJ_OUTPUT, exist_ok=True)
-os.makedirs(DIR_NJIHOV_ROOT, exist_ok=True)
-
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 eval_lpips_fn = lpips.LPIPS(net='alex', verbose=False).to(device).eval()
 
-print(f"\n[INFO] Pokretanje evaluacije na resursu: {device} | Val uzorak: {len(os.listdir(DIR_VAL_DEGRADED))} slika | Broj iteracija: {NUM_ITERACIJA}\n")
+print(f"\n[INFO] Evaluacija pokrenuta na: {device}")
+print(f"[INFO] Trening uzorci: {len(os.listdir(DIR_TRAIN_DEGRADED))} | Validacioni uzorci: {len(os.listdir(DIR_VAL_DEGRADED))}\n")
 
 
 # ==============================================================================
@@ -157,84 +157,7 @@ class VGGPerceptualLoss(nn.Module):
 
 
 # ==============================================================================
-# NJIHOV MODEL (MICROSOFT) SETUP I FINE-TUNING NA 5 EPOHA
-# ==============================================================================
-MS_REPO_DIR = '/content/Bringing-Old-Photos-Back-to-Life'
-
-if not os.path.exists(MS_REPO_DIR):
-    devnull = subprocess.DEVNULL
-    subprocess.run(f"git clone -q https://github.com/microsoft/Bringing-Old-Photos-Back-to-Life.git {MS_REPO_DIR}", shell=True, stdout=devnull, stderr=devnull)
-    p1 = os.path.join(MS_REPO_DIR, 'Face_Enhancement/models/networks')
-    p2 = os.path.join(MS_REPO_DIR, 'Global/detection_models')
-    subprocess.run(f"cd {p1} && git clone -q https://github.com/vacancy/Synchronized-BatchNorm-PyTorch && cp -rf Synchronized-BatchNorm-PyTorch/sync_batchnorm .", shell=True, stdout=devnull, stderr=devnull)
-    subprocess.run(f"cd {p2} && git clone -q https://github.com/vacancy/Synchronized-BatchNorm-PyTorch && cp -rf Synchronized-BatchNorm-PyTorch/sync_batchnorm .", shell=True, stdout=devnull, stderr=devnull)
-    subprocess.run(f"cd {MS_REPO_DIR}/Face_Enhancement && wget -q https://github.com/microsoft/Bringing-Old-Photos-Back-to-Life/releases/download/v1.0/face_checkpoints.zip && unzip -q face_checkpoints.zip", shell=True, stdout=devnull, stderr=devnull)
-    subprocess.run(f"cd {MS_REPO_DIR}/Global && wget -q https://github.com/microsoft/Bringing-Old-Photos-Back-to-Life/releases/download/v1.0/global_checkpoints.zip && unzip -q global_checkpoints.zip", shell=True, stdout=devnull, stderr=devnull)
-    subprocess.run(f"cd {MS_REPO_DIR}/Face_Detection && wget -q http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2 && bzip2 -d shape_predictor_68_face_landmarks.dat.bz2", shell=True, stdout=devnull, stderr=devnull)
-
-if MS_REPO_DIR not in sys.path:
-    sys.path.append(MS_REPO_DIR)
-    sys.path.append(os.path.join(MS_REPO_DIR, 'Global'))
-
-ms_ckpt_path = os.path.join(MS_REPO_DIR, 'Global/checkpoints/restoration/latest_net_G.pth')
-MS_DRIVE_CKPT = os.path.join(DRIVE_PROJECT_DIR, 'microsoft_finetuned_5_epochs.pth')
-
-try:
-    from Global.models.networks import define_G
-    ms_generator = define_G(3, 3, 64, "global", 3, 9, 1, 4, "instance", gpu_ids=[0]).to(device)
-    if os.path.exists(ms_ckpt_path):
-        ms_generator.load_state_dict(torch.load(ms_ckpt_path, map_location=device))
-except Exception:
-    ms_generator = None
-
-if os.path.exists(MS_DRIVE_CKPT):
-    print(f"✓ Pronađen sačuvan fine-tunovan Microsoft model (5 epoha): {MS_DRIVE_CKPT}")
-    if ms_generator is not None:
-        ms_state = torch.load(MS_DRIVE_CKPT, map_location=device)
-        ms_generator.load_state_dict(ms_state)
-        torch.save(ms_state, ms_ckpt_path)
-elif ms_generator is not None and EPOCHS_FINETUNE_NJIHOV > 0:
-    print(f"-> Pokrećem Fine-tuning Microsoft modela na {EPOCHS_FINETUNE_NJIHOV} epoha...")
-    train_ds = PairedDataset(DIR_TRAIN_CLEAN, DIR_TRAIN_DEGRADED, img_size=IMG_SIZE, train=True)
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True)
-    optimizer_ms = torch.optim.AdamW(ms_generator.parameters(), lr=LR_NJIHOV, weight_decay=1e-4)
-    crit_l1 = nn.L1Loss()
-    crit_vgg = VGGPerceptualLoss().to(device)
-    scaler_ms = torch.amp.GradScaler('cuda')
-
-    for ep in range(EPOCHS_FINETUNE_NJIHOV):
-        ms_generator.train()
-        total_ep_loss = 0.0
-        for d_t, c_t, _ in train_loader:
-            d_t, c_t = d_t.to(device), c_t.to(device)
-            optimizer_ms.zero_grad()
-            with torch.amp.autocast('cuda'):
-                pred = (ms_generator(d_t * 2.0 - 1.0) + 1.0) / 2.0
-                loss = crit_l1(pred, c_t) + 0.1 * crit_vgg(pred, c_t)
-            scaler_ms.scale(loss).backward()
-            scaler_ms.step(optimizer_ms)
-            scaler_ms.update()
-            total_ep_loss += loss.item()
-        print(f"   [Epoha {ep + 1}/{EPOCHS_FINETUNE_NJIHOV}] Loss: {total_ep_loss / len(train_loader):.4f}")
-
-    torch.save(ms_generator.state_dict(), ms_ckpt_path)
-    torch.save(ms_generator.state_dict(), MS_DRIVE_CKPT)
-    print(f"✓ Microsoft model uspešno istreniran na 5 epoha i sačuvan na Drive: {MS_DRIVE_CKPT}")
-
-subprocess.run(
-    f"cd {MS_REPO_DIR} && python run.py --input_folder {DIR_VAL_DEGRADED} --output_folder {DIR_NJIHOV_ROOT} --GPU 0 --with_scratch",
-    shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-)
-
-if not os.path.exists(DIR_NJIHOV_OUTPUT) or len(os.listdir(DIR_NJIHOV_OUTPUT)) == 0:
-    for alt in [os.path.join(DIR_NJIHOV_ROOT, 'stage_3_restore_output'), os.path.join(DIR_NJIHOV_ROOT, 'restored_image')]:
-        if os.path.exists(alt) and len(os.listdir(alt)) > 0:
-            DIR_NJIHOV_OUTPUT = alt
-            break
-
-
-# ==============================================================================
-# MOJA ARHITEKTURA ZA RESTAURACIJU
+# ARHITEKTURA MODELA
 # ==============================================================================
 class DepthwiseSeparableConv2d(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, kernel_size: int = 3, padding: int = 1, dilation: int = 1):
@@ -627,27 +550,36 @@ class Restauracija(nn.Module):
 
 
 # ==============================================================================
-# UČITAVANJE MOG MODELA
+# UČITAVANJE BAZNOG MODELA
 # ==============================================================================
 moj_model = Restauracija(base_ch=32).to(device)
-
+priority_ckpts = ['Model_Finetuned_Final.pth', 'best_model.pth', 'model.pth']
 model_loaded = False
-priority_ckpts = ['Model_Finetuned_Final.pth']
 
 for ckpt_name in priority_ckpts:
     ckpt_p = os.path.join(DRIVE_PROJECT_DIR, ckpt_name)
     if os.path.exists(ckpt_p):
         print(f"✓ Učitavam sačuvani model iz: {ckpt_p}")
         ckpt = torch.load(ckpt_p, map_location=device, weights_only=False)
-        moj_model.load_state_dict(ckpt['model_state_dict'] if isinstance(ckpt, dict) and 'model_state_dict' in ckpt else ckpt, strict=False)
+        moj_model.load_state_dict(ckpt['model_state_dict'] if isinstance(ckpt, dict) and 'model_state_dict' in ckpt else ckpt, strict=True)
         model_loaded = True
         break
 
 if not model_loaded:
-    print("[UPOZORENJE] Nije pronađen checkpoint na Google Drive-u!")
+    raise FileNotFoundError("[GREŠKA] Nije pronađen validan checkpoint na Google Drive-u!")
 
-moj_model.eval()
 val_files = sorted([f for f in os.listdir(DIR_VAL_DEGRADED) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
+train_ds = PairedDataset(DIR_TRAIN_CLEAN, DIR_TRAIN_DEGRADED, img_size=IMG_SIZE, train=True)
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True)
+
+
+# ==============================================================================
+# STATISTIČKE FUNKCIJE
+# ==============================================================================
+def ci95(vals):
+    vals = np.array(vals)
+    lo, hi = np.percentile(vals, [2.5, 97.5])
+    return np.mean(vals), np.std(vals), lo, hi
 
 def format_p_val(p):
     if p < 0.001:
@@ -659,9 +591,50 @@ def format_p_val(p):
     else:
         return f"{p:.4f} (ns)"
 
+def holm_bonferroni(p_vals):
+    """Holm-Bonferroni korekcija za višestruko testiranje hipoteza."""
+    m = len(p_vals)
+    indexed = sorted(enumerate(p_vals), key=lambda x: x[1])
+    corrected = [0.0] * m
+    running_max = 0.0
+    for rank, (orig_idx, p) in enumerate(indexed):
+        adj_p = min(1.0, p * (m - rank))
+        running_max = max(running_max, adj_p)
+        corrected[orig_idx] = running_max
+    return corrected
+
 
 # ==============================================================================
-# 1. EVALUACIJA SVIH KONFIGURACIJA I MICROSOFT MODELA (POTPUNO USKLAĐENO)
+# 0. IZRAČUNAVANJE POLAZNOG KVALITETA ULAZA (NALAZ K1)
+# ==============================================================================
+print(f"\n[INFO] Računanje polaznih vrednosti za neobrađeni degradirani ulaz (K1)...")
+cached_input_baseline = []
+
+with torch.no_grad():
+    for fname in val_files:
+        c_p = os.path.join(DIR_VAL_CLEAN, fname)
+        d_p = os.path.join(DIR_VAL_DEGRADED, fname)
+        if not (os.path.exists(c_p) and os.path.exists(d_p)):
+            continue
+
+        c_img = cv2.resize(cv2.cvtColor(cv2.imread(c_p), cv2.COLOR_BGR2RGB), (IMG_SIZE, IMG_SIZE)).astype(np.float32) / 255.0
+        d_img = cv2.resize(cv2.cvtColor(cv2.imread(d_p), cv2.COLOR_BGR2RGB), (IMG_SIZE, IMG_SIZE)).astype(np.float32) / 255.0
+
+        c_eval_t = torch.from_numpy(c_img).permute(2, 0, 1).unsqueeze(0).to(device) * 2.0 - 1.0
+        d_eval_t = torch.from_numpy(d_img).permute(2, 0, 1).unsqueeze(0).to(device) * 2.0 - 1.0
+
+        mse_in = np.mean((c_img - d_img) ** 2)
+        psnr_in = 10.0 * np.log10(1.0 / mse_in) if mse_in > 0 else 100.0
+        ssim_in = ssim_metric(c_img, d_img, channel_axis=2, data_range=1.0)
+        lpips_in = eval_lpips_fn(d_eval_t, c_eval_t).item()
+
+        cached_input_baseline.append({'Fname': fname, 'PSNR': psnr_in, 'SSIM': ssim_in, 'LPIPS': lpips_in})
+
+df_input_baseline = pd.DataFrame(cached_input_baseline).set_index('Fname')
+
+
+# ==============================================================================
+# 1. METODOLOŠKI ISPRAVNA ABLACIJA SA ADAPTACIJOM (5 EPOHA) (NALAZ K3)
 # ==============================================================================
 ablation_configs = [
     ("Full Proposed Model",                   dict()),
@@ -677,11 +650,54 @@ ablation_configs = [
     ("10. w/o Contrast Color Recovery (CCR)", dict(use_ccr=False)),
 ]
 
-cached_1po1_results = {}
-cached_njihov_results = []
-print(f"\n[INFO] Evaluacija modela za ablaciju i direktno poređenje...")
+def adaptiraj_ablacioni_model(base_model, cfg_name, cfg_kwargs, epochs=EPOCHS_FINETUNE_ABLATION):
+    """
+    Adaptira model nakon isključivanja komponente (5 epoha) kako bi se
+    izmerio pravi kapacitet arhitekture bez konfundirajućeg kolapsa aktivacija.
+    """
+    if cfg_name == "Full Proposed Model":
+        return base_model
 
-for naziv, cfg in tqdm(ablation_configs, desc="1-po-1 Eval"):
+    sanitized = re.sub(r'[^a-zA-Z0-9_]', '_', cfg_name)
+    save_path = os.path.join(DIR_ABLACIJA_DRIVE, f"ablation_{sanitized}_5ep.pth")
+
+    model_variant = copy.deepcopy(base_model).to(device)
+
+    if os.path.exists(save_path):
+        print(f"   ✓ [Keš] Učitavam adaptirani model: {cfg_name}")
+        model_variant.load_state_dict(torch.load(save_path, map_location=device))
+        return model_variant
+
+    print(f"   -> [Fine-tune {epochs} ep.] Adaptacija za: {cfg_name}...")
+    optimizer = torch.optim.AdamW(model_variant.parameters(), lr=LR_ABLATION, weight_decay=1e-4)
+    crit_l1 = nn.L1Loss()
+    crit_vgg = VGGPerceptualLoss().to(device)
+    scaler = torch.amp.GradScaler('cuda')
+
+    for ep in range(epochs):
+        model_variant.train()
+        total_loss = 0.0
+        for d_t, c_t, _ in train_loader:
+            d_t, c_t = d_t.to(device), c_t.to(device)
+            optimizer.zero_grad()
+            with torch.amp.autocast('cuda'):
+                pred = model_variant(d_t, **cfg_kwargs)
+                loss = crit_l1(pred, c_t) + 0.1 * crit_vgg(pred, c_t)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            total_loss += loss.item()
+
+    torch.save(model_variant.state_dict(), save_path)
+    return model_variant
+
+cached_1po1_results = {}
+print(f"\n[INFO] Pokretanje adaptacije i evaluacije ablacione studije...")
+
+for naziv, cfg in ablation_configs:
+    active_model = adaptiraj_ablacioni_model(moj_model, naziv, cfg)
+    active_model.eval()
+
     res_list = []
     with torch.no_grad():
         for fname in val_files:
@@ -694,8 +710,9 @@ for naziv, cfg in tqdm(ablation_configs, desc="1-po-1 Eval"):
             d_img = cv2.resize(cv2.cvtColor(cv2.imread(d_p), cv2.COLOR_BGR2RGB), (IMG_SIZE, IMG_SIZE)).astype(np.float32) / 255.0
 
             d_t = torch.from_numpy(d_img).permute(2, 0, 1).unsqueeze(0).to(device)
-            out_t = torch.clamp(moj_model(d_t, **cfg), 0.0, 1.0)
+            out_t = torch.clamp(active_model(d_t, **cfg), 0.0, 1.0)
             out_np = (out_t.squeeze(0).cpu().numpy().transpose(1, 2, 0) * 255.0).round().astype(np.uint8).astype(np.float32) / 255.0
+
             out_eval_t = torch.from_numpy(out_np).permute(2, 0, 1).unsqueeze(0).to(device) * 2.0 - 1.0
             c_eval_t = torch.from_numpy(c_img).permute(2, 0, 1).unsqueeze(0).to(device) * 2.0 - 1.0
 
@@ -708,7 +725,38 @@ for naziv, cfg in tqdm(ablation_configs, desc="1-po-1 Eval"):
 
     cached_1po1_results[naziv] = pd.DataFrame(res_list).set_index('Fname')
 
-# Evaluacija Microsoft modela na istom validacionom skupu
+
+# ==============================================================================
+# 2. MICROSOFT MODEL RESTAURACIJE (BOPBL)
+# ==============================================================================
+MS_REPO_DIR = '/content/Bringing-Old-Photos-Back-to-Life'
+DIR_NJIHOV_ROOT = '/content/rezultati_njihov_model'
+DIR_NJIHOV_OUTPUT = os.path.join(DIR_NJIHOV_ROOT, 'final_output')
+os.makedirs(DIR_NJIHOV_ROOT, exist_ok=True)
+
+if not os.path.exists(MS_REPO_DIR):
+    devnull = subprocess.DEVNULL
+    subprocess.run(f"git clone -q https://github.com/microsoft/Bringing-Old-Photos-Back-to-Life.git {MS_REPO_DIR}", shell=True, stdout=devnull, stderr=devnull)
+    p1 = os.path.join(MS_REPO_DIR, 'Face_Enhancement/models/networks')
+    p2 = os.path.join(MS_REPO_DIR, 'Global/detection_models')
+    subprocess.run(f"cd {p1} && git clone -q https://github.com/vacancy/Synchronized-BatchNorm-PyTorch && cp -rf Synchronized-BatchNorm-PyTorch/sync_batchnorm .", shell=True, stdout=devnull, stderr=devnull)
+    subprocess.run(f"cd {p2} && git clone -q https://github.com/vacancy/Synchronized-BatchNorm-PyTorch && cp -rf Synchronized-BatchNorm-PyTorch/sync_batchnorm .", shell=True, stdout=devnull, stderr=devnull)
+    subprocess.run(f"cd {MS_REPO_DIR}/Face_Enhancement && wget -q https://github.com/microsoft/Bringing-Old-Photos-Back-to-Life/releases/download/v1.0/face_checkpoints.zip && unzip -q face_checkpoints.zip", shell=True, stdout=devnull, stderr=devnull)
+    subprocess.run(f"cd {MS_REPO_DIR}/Global && wget -q https://github.com/microsoft/Bringing-Old-Photos-Back-to-Life/releases/download/v1.0/global_checkpoints.zip && unzip -q global_checkpoints.zip", shell=True, stdout=devnull, stderr=devnull)
+    subprocess.run(f"cd {MS_REPO_DIR}/Face_Detection && wget -q http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2 && bzip2 -d shape_predictor_68_face_landmarks.dat.bz2", shell=True, stdout=devnull, stderr=devnull)
+
+subprocess.run(
+    f"cd {MS_REPO_DIR} && python run.py --input_folder {DIR_VAL_DEGRADED} --output_folder {DIR_NJIHOV_ROOT} --GPU 0",
+    shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+)
+
+if not os.path.exists(DIR_NJIHOV_OUTPUT) or len(os.listdir(DIR_NJIHOV_OUTPUT)) == 0:
+    for alt in [os.path.join(DIR_NJIHOV_ROOT, 'stage_3_restore_output'), os.path.join(DIR_NJIHOV_ROOT, 'restored_image')]:
+        if os.path.exists(alt) and len(os.listdir(alt)) > 0:
+            DIR_NJIHOV_OUTPUT = alt
+            break
+
+cached_njihov_results = []
 with torch.no_grad():
     for fname in val_files:
         c_p = os.path.join(DIR_VAL_CLEAN, fname)
@@ -736,29 +784,43 @@ df_njihov = pd.DataFrame(cached_njihov_results).set_index('Fname')
 
 
 # ==============================================================================
-# 2. PROCESIRANJE 5 BOOTSTRAP ITERACIJA (POTPUNO USKLAĐENO)
+# 3. PROCESIRANJE BOOTSTRAP ITERACIJA (NUM_ITERACIJA = 1000)
 # ==============================================================================
 raw_data_runs_1po1 = {cfg_name: {'PSNR_runs': [], 'SSIM_runs': [], 'LPIPS_runs': []} for cfg_name, _ in ablation_configs}
+runs_input_psnr, runs_input_ssim, runs_input_lpips = [], [], []
 runs_njihov_psnr, runs_njihov_ssim, runs_njihov_lpips = [], [], []
 
 for iter_idx in range(NUM_ITERACIJA):
-    rng = np.random.default_rng(seed=42 + iter_idx)
+    rng = np.random.default_rng(seed=SEED + iter_idx)
     boot_files = rng.choice(val_files, size=len(val_files), replace=True)
-    
-    # Za sve konfiguracije ablacije
+
+    # 1. Ulaz bez restauracije (K1)
+    df_in_sub = df_input_baseline.loc[boot_files]
+    runs_input_psnr.append(df_in_sub['PSNR'].mean())
+    runs_input_ssim.append(df_in_sub['SSIM'].mean())
+    runs_input_lpips.append(df_in_sub['LPIPS'].mean())
+
+    # 2. Sve konfiguracije ablacije
     for naziv, _ in ablation_configs:
         df_sub = cached_1po1_results[naziv].loc[boot_files]
         raw_data_runs_1po1[naziv]['PSNR_runs'].append(df_sub['PSNR'].mean())
         raw_data_runs_1po1[naziv]['SSIM_runs'].append(df_sub['SSIM'].mean())
         raw_data_runs_1po1[naziv]['LPIPS_runs'].append(df_sub['LPIPS'].mean())
-        
-    # Za Microsoft model kroz identične iteracije
+
+    # 3. Microsoft model
     df_nj_sub = df_njihov.loc[boot_files]
     runs_njihov_psnr.append(df_nj_sub['PSNR'].mean())
     runs_njihov_ssim.append(df_nj_sub['SSIM'].mean())
     runs_njihov_lpips.append(df_nj_sub['LPIPS'].mean())
 
-# Računanje Direktnog poređenja (korišćenjem tačno izravnatih podataka)
+
+# ==============================================================================
+# 4. TABELE: DIREKTNO POREĐENJE I BASELINE (K1, K2)
+# ==============================================================================
+in_p_m, _, _, _ = ci95(runs_input_psnr)
+in_s_m, _, _, _ = ci95(runs_input_ssim)
+in_l_m, _, _, _ = ci95(runs_input_lpips)
+
 moj_full_p = cached_1po1_results["Full Proposed Model"]['PSNR'].values
 moj_full_s = cached_1po1_results["Full Proposed Model"]['SSIM'].values
 moj_full_l = cached_1po1_results["Full Proposed Model"]['LPIPS'].values
@@ -767,230 +829,143 @@ nj_full_p = df_njihov['PSNR'].values
 nj_full_s = df_njihov['SSIM'].values
 nj_full_l = df_njihov['LPIPS'].values
 
+moj_p_m, moj_p_sd, moj_p_lo, moj_p_hi = ci95(raw_data_runs_1po1["Full Proposed Model"]['PSNR_runs'])
+moj_s_m, moj_s_sd, moj_s_lo, moj_s_hi = ci95(raw_data_runs_1po1["Full Proposed Model"]['SSIM_runs'])
+moj_l_m, moj_l_sd, moj_l_lo, moj_l_hi = ci95(raw_data_runs_1po1["Full Proposed Model"]['LPIPS_runs'])
+
+nj_p_m, nj_p_sd, nj_p_lo, nj_p_hi = ci95(runs_njihov_psnr)
+nj_s_m, nj_s_sd, nj_s_lo, nj_s_hi = ci95(runs_njihov_ssim)
+nj_l_m, nj_l_sd, nj_l_lo, nj_l_hi = ci95(runs_njihov_lpips)
+
 _, p_w_p = stats.wilcoxon(moj_full_p, nj_full_p)
-_, p_w_s = stats.wilcoxon(moj_full_s, nj_full_s)
-_, p_w_l = stats.wilcoxon(moj_full_l, nj_full_l)
-
 _, p_t_p = stats.ttest_rel(moj_full_p, nj_full_p)
-_, p_t_s = stats.ttest_rel(moj_full_s, nj_full_s)
-_, p_t_l = stats.ttest_rel(moj_full_l, nj_full_l)
-
 d_psnr = np.mean(moj_full_p - nj_full_p) / np.std(moj_full_p - nj_full_p, ddof=1)
+
+_, p_w_s = stats.wilcoxon(moj_full_s, nj_full_s)
+_, p_t_s = stats.ttest_rel(moj_full_s, nj_full_s)
 d_ssim = np.mean(moj_full_s - nj_full_s) / np.std(moj_full_s - nj_full_s, ddof=1)
+
+_, p_w_l = stats.wilcoxon(moj_full_l, nj_full_l)
+_, p_t_l = stats.ttest_rel(moj_full_l, nj_full_l)
 d_lpips = np.mean(moj_full_l - nj_full_l) / np.std(moj_full_l - nj_full_l, ddof=1)
 
-moj_psnr_mean = np.mean(raw_data_runs_1po1["Full Proposed Model"]['PSNR_runs'])
-moj_ssim_mean = np.mean(raw_data_runs_1po1["Full Proposed Model"]['SSIM_runs'])
-moj_lpips_mean = np.mean(raw_data_runs_1po1["Full Proposed Model"]['LPIPS_runs'])
-
-nj_psnr_mean = np.mean(runs_njihov_psnr)
-nj_ssim_mean = np.mean(runs_njihov_ssim)
-nj_lpips_mean = np.mean(runs_njihov_lpips)
-
 tabela_direktna = [
-    ['PSNR (dB) [↑]', f"{moj_psnr_mean:.2f}", f"{nj_psnr_mean:.2f}", f"+{moj_psnr_mean - nj_psnr_mean:.2f} dB", format_p_val(p_w_p), format_p_val(p_t_p), f"{d_psnr:.2f}"],
-    ['SSIM [↑]', f"{moj_ssim_mean:.4f}", f"{nj_ssim_mean:.4f}", f"+{moj_ssim_mean - nj_ssim_mean:.4f}", format_p_val(p_w_s), format_p_val(p_t_s), f"{d_ssim:.2f}"],
-    ['LPIPS [↓]', f"{moj_lpips_mean:.4f}", f"{nj_lpips_mean:.4f}", f"{moj_lpips_mean - nj_lpips_mean:.4f}", format_p_val(p_w_l), format_p_val(p_t_l), f"{d_lpips:.2f}"]
+    ['PSNR (dB) [↑]', f"{in_p_m:.2f}", f"{moj_p_m:.2f} [{moj_p_lo:.2f}, {moj_p_hi:.2f}]", f"{nj_p_m:.2f} [{nj_p_lo:.2f}, {nj_p_hi:.2f}]", f"+{moj_p_m - in_p_m:.2f} dB", f"+{moj_p_m - nj_p_m:.2f} dB", format_p_val(p_w_p), format_p_val(p_t_p), f"{d_psnr:.2f}"],
+    ['SSIM [↑]', f"{in_s_m:.4f}", f"{moj_s_m:.4f} [{moj_s_lo:.4f}, {moj_s_hi:.4f}]", f"{nj_s_m:.4f} [{nj_s_lo:.4f}, {nj_s_hi:.4f}]", f"+{moj_s_m - in_s_m:.4f}", f"+{moj_s_m - nj_s_m:.4f}", format_p_val(p_w_s), format_p_val(p_t_s), f"{d_ssim:.2f}"],
+    ['LPIPS [↓]', f"{in_l_m:.4f}", f"{moj_l_m:.4f} [{moj_l_lo:.4f}, {moj_l_hi:.4f}]", f"{nj_l_m:.4f} [{nj_l_lo:.4f}, {nj_l_hi:.4f}]", f"{moj_l_m - in_l_m:.4f}", f"{moj_l_m - nj_l_m:.4f}", format_p_val(p_w_l), format_p_val(p_t_l), f"{d_lpips:.2f}"]
 ]
-headers_direktna = ['Metrika', 'Moj Model (Mean)', 'Njihov Model (Mean)', 'Δ Razlika', 'Wilcoxon', 'Paired t-test', "Cohen's d"]
+headers_direktna = ['Metrika', 'Ulaz (Bez Rest.)', 'Moj Model (95% CI)', 'Microsoft BOPBL', 'Δ (vs Ulaz)', 'Δ (vs BOPBL)', 'Wilcoxon', 't-test', "Cohen's d"]
 
 
 # ==============================================================================
-# 3. TABELE ABLACIJE (BEZ "+-")
+# 5. TABELE ABLACIJE SA STATISTIKOM I HOLM-BONFERRONI KOREKCIJOM (K3, K4, M4)
 # ==============================================================================
 summary_abl = []
+raw_p_wilcoxon = []
+raw_p_ttest = []
+diffs_psnr = []
+cohens_d_list = []
+comp_names = []
+
 for naziv, _ in ablation_configs:
     p_runs = raw_data_runs_1po1[naziv]['PSNR_runs']
     s_runs = raw_data_runs_1po1[naziv]['SSIM_runs']
     l_runs = raw_data_runs_1po1[naziv]['LPIPS_runs']
 
+    p_m, p_sd, p_lo, p_hi = ci95(p_runs)
+    s_m, s_sd, s_lo, s_hi = ci95(s_runs)
+    l_m, l_sd, l_lo, l_hi = ci95(l_runs)
+
     summary_abl.append([
         naziv,
-        f"{p_runs[0]:.2f}", f"{p_runs[1]:.2f}", f"{p_runs[2]:.2f}", f"{p_runs[3]:.2f}", f"{p_runs[4]:.2f}",
-        f"{np.mean(p_runs):.2f}",
-        f"{np.mean(s_runs):.4f}",
-        f"{np.mean(l_runs):.4f}"
+        f"{p_m:.2f} ± {p_sd:.2f} [{p_lo:.2f}, {p_hi:.2f}]",
+        f"{s_m:.4f} ± {s_sd:.4f} [{s_lo:.4f}, {s_hi:.4f}]",
+        f"{l_m:.4f} ± {l_sd:.4f} [{l_lo:.4f}, {l_hi:.4f}]"
     ])
 
-headers_abl_mean = ['Konfiguracija Modela', 'It. 1', 'It. 2', 'It. 3', 'It. 4', 'It. 5', 'PSNR (Mean) [↑]', 'SSIM (Mean) [↑]', 'LPIPS (Mean) [↓]']
+    if naziv != "Full Proposed Model":
+        var_p = cached_1po1_results[naziv]['PSNR'].values
+        diff_p = moj_full_p - var_p
+        _, p_w = stats.wilcoxon(moj_full_p, var_p)
+        _, p_t = stats.ttest_rel(moj_full_p, var_p)
+        d_val = np.mean(diff_p) / np.std(diff_p, ddof=1) if np.std(diff_p, ddof=1) > 0 else 0.0
 
-# Statistika za 1-po-1
+        comp_names.append(naziv)
+        diffs_psnr.append(np.mean(diff_p))
+        raw_p_wilcoxon.append(p_w)
+        raw_p_ttest.append(p_t)
+        cohens_d_list.append(d_val)
+
+# Holm-Bonferroni korekcija (M4)
+adj_p_wilcoxon = holm_bonferroni(raw_p_wilcoxon)
+adj_p_ttest = holm_bonferroni(raw_p_ttest)
+
 stat_abl_table = []
-for naziv, _ in ablation_configs:
-    if naziv == "Full Proposed Model":
-        continue
-
-    var_p = cached_1po1_results[naziv]['PSNR'].values
-    var_s = cached_1po1_results[naziv]['SSIM'].values
-    var_l = cached_1po1_results[naziv]['LPIPS'].values
-
-    diff_p = moj_full_p - var_p
-    _, p_w_p = stats.wilcoxon(moj_full_p, var_p)
-    _, p_t_p = stats.ttest_rel(moj_full_p, var_p)
-    d_p = np.mean(diff_p) / np.std(diff_p, ddof=1) if np.std(diff_p, ddof=1) > 0 else 0.0
-
-    _, p_w_s = stats.wilcoxon(moj_full_s, var_s)
-    _, p_w_l = stats.wilcoxon(moj_full_l, var_l)
-
+for name, d_psnr_val, p_w, p_w_adj, p_t_adj, d_val in zip(comp_names, diffs_psnr, raw_p_wilcoxon, adj_p_wilcoxon, adj_p_ttest, cohens_d_list):
     stat_abl_table.append([
-        naziv,
-        f"-{np.mean(diff_p):.2f} dB",
-        format_p_val(p_w_p),
-        format_p_val(p_t_p),
-        f"{d_p:.2f}",
-        format_p_val(p_w_s),
-        format_p_val(p_w_l)
+        name,
+        f"-{d_psnr_val:.2f} dB",
+        format_p_val(p_w),
+        format_p_val(p_w_adj),
+        format_p_val(p_t_adj),
+        f"{d_val:.2f}"
     ])
 
-headers_abl_stat = ['Uklonjena Komponenta', 'Δ PSNR', 'Wilcoxon (PSNR)', 't-test (PSNR)', "Cohen's d", 'Wilcoxon (SSIM)', 'Wilcoxon (LPIPS)']
+headers_abl_mean = ['Konfiguracija Modela (5 Epoha Adaptacije)', 'PSNR (Mean ± SD, 95% CI) [↑]', 'SSIM (Mean ± SD, 95% CI) [↑]', 'LPIPS (Mean ± SD, 95% CI) [↓]']
+headers_abl_stat = ['Uklonjena Komponenta', 'Δ PSNR', 'Wilcoxon (Sirovo p)', 'Wilcoxon (Holm-Bonf.)', 't-test (Holm-Bonf.)', "Cohen's d"]
 
 
 # ==============================================================================
-# 4. KOMBINATORNA ABLACIJA (BEZ "+-")
+# 6. ANALIZA PO KATEGORIJAMA OŠTEĆENJA (HIPOTEZA PROSTORNO VS SPEKTRALNO - O6)
 # ==============================================================================
-crit_components = [
-    ("Spectral", "use_spectral"),
-    ("EdgeBranch", "use_edge_branch"),
-    ("CCR", "use_ccr"),
-    ("SkipRefine", "use_skip_refine")
-]
-crit_keys = [k for _, k in crit_components]
+def izdvoji_kategoriju(fname):
+    fname_low = fname.lower()
+    kategorije = ['bud', 'ogrebotine', 'fleke', 'boja', 'sum', 'zamucenje', 'vlaga', 'kombinovano']
+    for k in kategorije:
+        if k in fname_low:
+            return k.capitalize()
+    return "Ostalo"
 
-pairwise_configs = [
-    ("Full Proposed Model", dict()),
-    ("w/o All 4 Critical [Spectral+Edge+CCR+SkipRefine]", {k: False for k in crit_keys}),
-    ("w/o [Spectral + EdgeBranch]", {"use_spectral": False, "use_edge_branch": False}),
-    ("w/o [Spectral + CCR]", {"use_spectral": False, "use_ccr": False}),
-    ("w/o [Spectral + SkipRefine]", {"use_spectral": False, "use_skip_refine": False}),
-    ("w/o [EdgeBranch + CCR]", {"use_edge_branch": False, "use_ccr": False}),
-    ("w/o [EdgeBranch + SkipRefine]", {"use_edge_branch": False, "use_skip_refine": False}),
-    ("w/o [CCR + SkipRefine]", {"use_ccr": False, "use_skip_refine": False}),
-    ("Only 4 Critical Active (All Secondary OFF)", {
-        "use_spectral": True, "use_edge_branch": True, "use_ccr": True, "use_skip_refine": True,
-        "use_cross_bridge": False, "use_gated_fusion": False, "use_damage_attention": False,
-        "use_dilated_context": False, "use_gated_skips": False
-    }),
-    ("Barebones Backbone (All OFF)", {
-        "use_spectral": False, "use_edge_branch": False, "use_ccr": False, "use_skip_refine": False,
-        "use_cross_bridge": False, "use_gated_fusion": False, "use_damage_attention": False,
-        "use_dilated_context": False, "use_gated_skips": False
-    })
-]
+df_full = cached_1po1_results["Full Proposed Model"].copy()
+df_no_spatial = cached_1po1_results["1. w/o Spatial Encoder Stream"].copy()
+df_no_spectral = cached_1po1_results["2. w/o Spectral Encoder Stream"].copy()
 
-cached_pair_results = {}
-print(f"\n[INFO] Evaluacija Kombinatorne ablacije...")
+df_full['Kategorija'] = [izdvoji_kategoriju(f) for f in df_full.index]
+df_no_spatial['Kategorija'] = [izdvoji_kategoriju(f) for f in df_no_spatial.index]
+df_no_spectral['Kategorija'] = [izdvoji_kategoriju(f) for f in df_no_spectral.index]
 
-for naziv, cfg in tqdm(pairwise_configs, desc="Kombinatorna Eval"):
-    res_list = []
-    with torch.no_grad():
-        for fname in val_files:
-            c_p = os.path.join(DIR_VAL_CLEAN, fname)
-            d_p = os.path.join(DIR_VAL_DEGRADED, fname)
-            if not (os.path.exists(c_p) and os.path.exists(d_p)):
-                continue
+tabela_kategorije = []
+for kat, grp in df_full.groupby('Kategorija'):
+    idx = grp.index
+    p_full = grp['PSNR'].mean()
+    p_no_spat = df_no_spatial.loc[idx]['PSNR'].mean()
+    p_no_spec = df_no_spectral.loc[idx]['PSNR'].mean()
+    tabela_kategorije.append([kat, len(idx), f"{p_full:.2f}", f"{p_no_spat:.2f}", f"{p_no_spec:.2f}", f"{p_full - p_no_spat:+.2f}", f"{p_full - p_no_spec:+.2f}"])
 
-            c_img = cv2.resize(cv2.cvtColor(cv2.imread(c_p), cv2.COLOR_BGR2RGB), (IMG_SIZE, IMG_SIZE)).astype(np.float32) / 255.0
-            d_img = cv2.resize(cv2.cvtColor(cv2.imread(d_p), cv2.COLOR_BGR2RGB), (IMG_SIZE, IMG_SIZE)).astype(np.float32) / 255.0
-
-            d_t = torch.from_numpy(d_img).permute(2, 0, 1).unsqueeze(0).to(device)
-            out_t = torch.clamp(moj_model(d_t, **cfg), 0.0, 1.0)
-            out_np = (out_t.squeeze(0).cpu().numpy().transpose(1, 2, 0) * 255.0).round().astype(np.uint8).astype(np.float32) / 255.0
-            out_eval_t = torch.from_numpy(out_np).permute(2, 0, 1).unsqueeze(0).to(device) * 2.0 - 1.0
-            c_eval_t = torch.from_numpy(c_img).permute(2, 0, 1).unsqueeze(0).to(device) * 2.0 - 1.0
-
-            mse = np.mean((c_img - out_np) ** 2)
-            psnr_val = 10.0 * np.log10(1.0 / mse) if mse > 0 else 100.0
-            ssim_val = ssim_metric(c_img, out_np, channel_axis=2, data_range=1.0)
-            lpips_val = eval_lpips_fn(out_eval_t, c_eval_t).item()
-
-            res_list.append({'Fname': fname, 'PSNR': psnr_val, 'SSIM': ssim_val, 'LPIPS': lpips_val})
-
-    cached_pair_results[naziv] = pd.DataFrame(res_list).set_index('Fname')
-
-pairwise_data_runs = {cfg_name: {'PSNR_runs': [], 'SSIM_runs': [], 'LPIPS_runs': []} for cfg_name, _ in pairwise_configs}
-
-for iter_idx in range(NUM_ITERACIJA):
-    rng = np.random.default_rng(seed=42 + iter_idx)
-    boot_files = rng.choice(val_files, size=len(val_files), replace=True)
-    for naziv, _ in pairwise_configs:
-        df_sub = cached_pair_results[naziv].loc[boot_files]
-        pairwise_data_runs[naziv]['PSNR_runs'].append(df_sub['PSNR'].mean())
-        pairwise_data_runs[naziv]['SSIM_runs'].append(df_sub['SSIM'].mean())
-        pairwise_data_runs[naziv]['LPIPS_runs'].append(df_sub['LPIPS'].mean())
-
-summary_pair = []
-for naziv, _ in pairwise_configs:
-    p_runs = pairwise_data_runs[naziv]['PSNR_runs']
-    s_runs = pairwise_data_runs[naziv]['SSIM_runs']
-    l_runs = pairwise_data_runs[naziv]['LPIPS_runs']
-
-    summary_pair.append([
-        naziv,
-        f"{p_runs[0]:.2f}", f"{p_runs[1]:.2f}", f"{p_runs[2]:.2f}", f"{p_runs[3]:.2f}", f"{p_runs[4]:.2f}",
-        f"{np.mean(p_runs):.2f}",
-        f"{np.mean(s_runs):.4f}",
-        f"{np.mean(l_runs):.4f}"
-    ])
-
-headers_pair_mean = ['Konfiguracija Modela', 'It. 1', 'It. 2', 'It. 3', 'It. 4', 'It. 5', 'PSNR (Mean) [↑]', 'SSIM (Mean) [↑]', 'LPIPS (Mean) [↓]']
-
-# Statistika za Kombinatornu
-stat_pair_table = []
-for naziv, _ in pairwise_configs:
-    if naziv == "Full Proposed Model":
-        continue
-
-    var_p = cached_pair_results[naziv]['PSNR'].values
-    var_s = cached_pair_results[naziv]['SSIM'].values
-    var_l = cached_pair_results[naziv]['LPIPS'].values
-
-    diff_p = moj_full_p - var_p
-    _, p_w_p = stats.wilcoxon(moj_full_p, var_p)
-    _, p_t_p = stats.ttest_rel(moj_full_p, var_p)
-    d_p = np.mean(diff_p) / np.std(diff_p, ddof=1) if np.std(diff_p, ddof=1) > 0 else 0.0
-
-    _, p_w_s = stats.wilcoxon(moj_full_s, var_s)
-    _, p_w_l = stats.wilcoxon(moj_full_l, var_l)
-
-    stat_pair_table.append([
-        naziv,
-        f"-{np.mean(diff_p):.2f} dB",
-        format_p_val(p_w_p),
-        format_p_val(p_t_p),
-        f"{d_p:.2f}",
-        format_p_val(p_w_s),
-        format_p_val(p_w_l)
-    ])
-
-headers_pair_stat = ['Uklonjena Komponenta', 'Δ PSNR', 'Wilcoxon (PSNR)', 't-test (PSNR)', "Cohen's d", 'Wilcoxon (SSIM)', 'Wilcoxon (LPIPS)']
+headers_kategorije = ['Kategorija Oštećenja', 'N Uzoraka', 'Full Model (dB)', 'w/o Spatial (dB)', 'w/o Spectral (dB)', 'Pad bez Spatial', 'Pad bez Spectral']
 
 
 # ==============================================================================
 # PRIKAZ REZULTATA U TERMINALU
 # ==============================================================================
-print("\n" + "█" * 120)
-print("  1. DIREKTNO POREĐENJE: PREDLOŽENI MODEL VS MICROSOFT (5 ITERACIJA + STATISTIKA)")
-print("█" * 120)
+print("\n" + "█" * 125)
+print(f"  1. DIREKTNO POREĐENJE I BAZNA LINIJA ULAZA (K1, K2) [Bootstrap {NUM_ITERACIJA}× | 95% CI]")
+print("█" * 125)
 print(tabulate(tabela_direktna, headers=headers_direktna, tablefmt="fancy_grid", stralign="center", numalign="center"))
 
-print("\n" + "█" * 120)
-print(f"  2. POJEDINAČNA ABLACIJA: ITERACIJE I SREDNJE VREDNOSTI (N = {len(val_files)})")
-print("█" * 120)
+print("\n" + "█" * 125)
+print(f"  2. PRAVA ABLACIONA STUDIJA SA 5-EPOHNOM ADAPTACIJOM (K3, K4) [N = {len(val_files)}]")
+print("█" * 125)
 print(tabulate(summary_abl, headers=headers_abl_mean, tablefmt="fancy_grid", stralign="center", numalign="center"))
 
-print("\n" + "█" * 120)
-print("  3. POJEDINAČNA ABLACIJA: STATISTIČKI TESTOVI ZNAČAJNOSTI (vs Full Model)")
-print("█" * 120)
+print("\n" + "█" * 125)
+print("  3. STATISTIČKA ZNAČAJNOST ABLACIJE SA HOLM-BONFERRONI KOREKCIJOM (M4)")
+print("█" * 125)
 print(tabulate(stat_abl_table, headers=headers_abl_stat, tablefmt="fancy_grid", stralign="center", numalign="center"))
 
-print("\n" + "█" * 120)
-print(f"  4. KOMBINATORNA ABLACIJA: ITERACIJE I SREDNJE VREDNOSTI (N = {len(val_files)})")
-print("█" * 120)
-print(tabulate(summary_pair, headers=headers_pair_mean, tablefmt="fancy_grid", stralign="center", numalign="center"))
+print("\n" + "█" * 125)
+print("  4. TEST CENTRALNE HIPOTEZE: PROSTORNI VS SPEKTRALNI TOK PO TIPOVIMA OŠTEĆENJA (O6)")
+print("█" * 125)
+print(tabulate(tabela_kategorije, headers=headers_kategorije, tablefmt="fancy_grid", stralign="center", numalign="center"))
 
-print("\n" + "█" * 120)
-print("  5. KOMBINATORNA ABLACIJA: STATISTIČKI TESTOVI ZNAČAJNOSTI (vs Full Model)")
-print("█" * 120)
-print(tabulate(stat_pair_table, headers=headers_pair_stat, tablefmt="fancy_grid", stralign="center", numalign="center"))
-
-print("\nLegenda statističke značajnosti: *** p < 0.001  |  ** p < 0.01  |  * p < 0.05  |  ns: nije značajno")
+print("\nLegenda: *** p < 0.001  |  ** p < 0.01  |  * p < 0.05  |  ns: nije statistički značajno")
