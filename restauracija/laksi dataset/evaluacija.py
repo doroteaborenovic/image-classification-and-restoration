@@ -1,4 +1,4 @@
-# evaluacija ova je dobra 
+# evaluacija ova je dobra (sa Baseline ulaznim metrikama i Delta PSNR/SSIM)
 from google.colab import drive
 import os
 import zipfile
@@ -368,7 +368,7 @@ class Restauracija(nn.Module):
         skip2_enhanced = self.skip_refine2(self.skip_gate2(s2_skip) + F.interpolate(c2, size=s2_skip.shape[2:], mode='bilinear', align_corners=False))
         skip1_enhanced = self.skip_refine1(self.skip_gate1(s1_skip) + F.interpolate(c1, size=s1_skip.shape[2:], mode='bilinear', align_corners=False))
         d4 = self.decoder4(bottleneck_out, skip4_enhanced, damage_map)
-        d3 = self.decoder3(d4, skip3_enhanced, damage_map)
+        d3 = self.decoder3(d4, skip4_enhanced if d4.shape[1] == 0 else skip3_enhanced, damage_map)
         d2 = self.decoder2(d3, skip2_enhanced, damage_map)
         d1 = self.decoder1(d2, skip1_enhanced, damage_map)
         if d1.shape[2:] != input_img.shape[2:]:
@@ -464,11 +464,24 @@ def pokreni_evaluaciju():
         input_tensor = transform_to_tensor(dmg_pil_resized).unsqueeze(0).to(device)
         clean_tensor = transform_to_tensor(clean_pil_resized).unsqueeze(0).to(device)
 
-        # DIREKTAN PROLAZ PREKO MREŽE (Čisto obnavljanje detalja)
+        # -------------------------------------------------------------
+        # BASELINE (K1): Proračun ulaznog PSNR-a i SSIM-a (pre restauracije)
+        # -------------------------------------------------------------
+        mse_in_float = torch.mean((input_tensor - clean_tensor) ** 2).item()
+        if mse_in_float > 0:
+            psnr_in = 10.0 * np.log10(1.0 / mse_in_float)
+        else:
+            psnr_in = 100.0
+
+        clean_np = np.array(clean_pil_resized)
+        dmg_np = np.array(dmg_pil_resized)
+        ssim_in = ssim_metric(clean_np, dmg_np, channel_axis=2, data_range=255)
+
+        # DIREKTAN PROLAZ PREKO MREŽE (Restauracija)
         with torch.no_grad():
             output_tensor = model(input_tensor)
 
-        # PARALELAN PRORAČUN PSNR-a NA FLOAT TENZORIMA (Tačno kao u treningu!)
+        # PARALELAN PRORAČUN MODEL PSNR-a
         mse_float = torch.mean((output_tensor - clean_tensor) ** 2).item()
         if mse_float > 0:
             psnr_val = 10.0 * np.log10(1.0 / mse_float)
@@ -477,22 +490,27 @@ def pokreni_evaluaciju():
 
         output_tensor_cpu = output_tensor.squeeze(0).cpu()
         restored_pil = transforms.ToPILImage()(output_tensor_cpu)
-
-        clean_np = np.array(clean_pil_resized)
-        dmg_np = np.array(dmg_pil_resized)
         restored_np = np.array(restored_pil)
 
         ssim_val = ssim_metric(clean_np, restored_np, channel_axis=2, data_range=255)
         mse_val = np.mean((clean_np.astype(np.float32) - restored_np.astype(np.float32)) ** 2)
         mae_val = np.mean(np.abs(clean_np.astype(np.float32) - restored_np.astype(np.float32)))
 
+        # RAČUNANJE DELTA (DOBITKA)
+        delta_psnr = psnr_val - psnr_in
+        delta_ssim = ssim_val - ssim_in
+
         dmg_type = detect_damage_type(dmg_f)
 
         results_list.append({
             'Filename': dmg_f,
             'Oštećenje': dmg_type,
-            'PSNR': psnr_val,
-            'SSIM': ssim_val,
+            'PSNR_Ulaz': psnr_in,
+            'PSNR_Model': psnr_val,
+            'Delta_PSNR': delta_psnr,
+            'SSIM_Ulaz': ssim_in,
+            'SSIM_Model': ssim_val,
+            'Delta_SSIM': delta_ssim,
             'MSE': mse_val,
             'MAE': mae_val
         })
@@ -521,15 +539,20 @@ def pokreni_evaluaciju():
 
     df = pd.DataFrame(results_list)
 
+    # GRUPISANJE SA BASELINE I DELTA METRIKAMA
     statistika = df.groupby('Oštećenje').agg(
         Broj_Slike=('Filename', 'count'),
-        Prosečan_PSNR=('PSNR', 'mean'),
-        Prosečan_SSIM=('SSIM', 'mean'),
+        Ulaz_PSNR=('PSNR_Ulaz', 'mean'),
+        Restaurisan_PSNR=('PSNR_Model', 'mean'),
+        ΔPSNR=('Delta_PSNR', 'mean'),
+        Ulaz_SSIM=('SSIM_Ulaz', 'mean'),
+        Restaurisan_SSIM=('SSIM_Model', 'mean'),
+        ΔSSIM=('Delta_SSIM', 'mean'),
         Prosečan_MSE=('MSE', 'mean'),
         Prosečan_MAE=('MAE', 'mean')
     ).reset_index()
 
-    statistika = statistika.sort_values(by='Prosečan_PSNR', ascending=False)
+    statistika = statistika.sort_values(by='Restaurisan_PSNR', ascending=False)
 
     csv_report_path = os.path.join(output_dir, 'izvestaj_metrika_test.csv')
     statistika.to_csv(csv_report_path, index=False)
@@ -537,20 +560,20 @@ def pokreni_evaluaciju():
     PINK = '\033[38;5;205m'
     RESET = '\033[0m'
 
-    print(f"\n\n{PINK}{'='*100}")
+    print(f"\n\n{PINK}{'='*115}")
     print(" EVALUACIJA USPEŠNO ZAVRŠENA")
-    print(f"{'='*100}")
+    print(f"{'='*115}")
     print(f"Pojedinačne restaurisane slike sačuvane u:  {pojedinacne_dir}")
     print(f"Uporedni primeri slika sačuvani u:          {poredjenja_dir}")
     print(f"Tabela sačuvana na:                       {csv_report_path}\n")
-    print("="*100)
-    print("REZULTATI:")
-    print("="*100)
+    print("="*115)
+    print("REZULTATI (ULAZ vs MODEL vs DOBITAK):")
+    print("="*115)
 
     pd.set_option('display.max_columns', None)
     pd.set_option('display.width', 1000)
     print(statistika.to_string(index=False))
-    print("="*100 + RESET)
+    print("="*115 + RESET)
 
 if __name__ == '__main__':
     pokreni_evaluaciju()
