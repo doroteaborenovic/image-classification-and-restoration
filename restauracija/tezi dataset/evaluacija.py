@@ -14,7 +14,9 @@ from tqdm import tqdm
 from skimage.metrics import peak_signal_noise_ratio as psnr_metric
 from skimage.metrics import structural_similarity as ssim_metric
 
+# =====================================================================
 # 1. MONTIRANJE I DEFINISANJE PUTANJA
+# =====================================================================
 drive.mount('/content/drive')
 
 zip_path = '/content/drive/MyDrive/Projekat_Model/DATASET_TEST.zip'
@@ -47,7 +49,6 @@ def find_dataset_folders(base_path):
     if not os.path.exists(base_path):
         return None, None
     
-    # 1. Proveri da li postoje podfolderi '0' (clean) i '1' (degraded)
     for root, dirs, files in os.walk(base_path):
         if '0' in dirs and '1' in dirs:
             f0_cand = os.path.join(root, '0')
@@ -529,10 +530,14 @@ def pokreni_evaluaciju():
         dmg_np = np.array(dmg_pil_resized)
 
         # -------------------------------------------------------------
-        # K1 BASELINE: Ulazni PSNR i SSIM (pre restauracije mreže)
+        # K1 BASELINE: Ulazni PSNR i SSIM (sa zaštitom od inf deljenja sa 0)
         # -------------------------------------------------------------
         psnr_in = psnr_metric(clean_np, dmg_np, data_range=255)
         ssim_in = ssim_metric(clean_np, dmg_np, channel_axis=2, data_range=255)
+
+        # Ako su ulazna i čista slika 100% identične (npr. oštećenje nije primenjeno), tretiramo kao NaN za prosek
+        if np.isinf(psnr_in):
+            psnr_in = np.nan
 
         input_tensor = transform_to_tensor(dmg_pil_resized).unsqueeze(0).to(device)
 
@@ -562,12 +567,15 @@ def pokreni_evaluaciju():
 
         # METRIKE MODELA
         psnr_val = psnr_metric(clean_np, restored_np, data_range=255)
+        if np.isinf(psnr_val):
+            psnr_val = 100.0  # limit u slučaju savršene rekonstrukcije
+
         ssim_val = ssim_metric(clean_np, restored_np, channel_axis=2, data_range=255)
         mse_val = np.mean((clean_np.astype(np.float32) - restored_np.astype(np.float32)) ** 2)
         mae_val = np.mean(np.abs(clean_np.astype(np.float32) - restored_np.astype(np.float32)))
 
         # K1 DOBITAK (DELTA)
-        delta_psnr = psnr_val - psnr_in
+        delta_psnr = (psnr_val - psnr_in) if not np.isnan(psnr_in) else np.nan
         delta_ssim = ssim_val - ssim_in
 
         dmg_type = detect_damage_type(dmg_f)
@@ -637,7 +645,7 @@ def pokreni_evaluaciju():
     else:
         statistika = df.groupby('Oštećenje').agg(
             Broj_Slike=('Filename', 'count'),
-            Ulaz_PSNR=('PSNR_Ulaz', 'mean'),
+            Ulaz_PSNR=('PSNR_Ulaz', 'mean'),             # automatski ignoriše NaN pri računanju proseka
             Restaurisan_PSNR=('PSNR_Model', 'mean'),
             ΔPSNR=('Delta_PSNR', 'mean'),
             Ulaz_SSIM=('SSIM_Ulaz', 'mean'),
