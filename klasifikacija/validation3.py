@@ -1,6 +1,4 @@
-# ==============================================================================
-# EVALUACIJA KLASIFIKACIJE SA ROC-AUC I REKALIBRACIJOM PRAGA (NALAZ O1)
-# ==============================================================================
+#with roc
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
