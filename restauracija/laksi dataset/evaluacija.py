@@ -1,4 +1,6 @@
-# evaluacija ova je dobra (sa Baseline ulaznim metrikama i Delta PSNR/SSIM)
+# =====================================================================
+# EVALUACIJA — LAKŠI TEST SKUP (Sa 4-way TTA, Baseline i Delta metrikama)
+# =====================================================================
 from google.colab import drive
 import os
 import zipfile
@@ -13,10 +15,12 @@ import pandas as pd
 import cv2
 from tqdm import tqdm
 from skimage.metrics import structural_similarity as ssim_metric
+from skimage.metrics import peak_signal_noise_ratio as psnr_metric
 
 # 1. MONTIRANJE I PUTANJE
 drive.mount('/content/drive')
 
+# Putanje za LAKŠI test skup
 zip_path = '/content/drive/MyDrive/Projekat_Model/test.zip'
 if not os.path.exists(zip_path):
     zip_path = '/content/drive/MyDrive/Projekat_Model/DATASET_TEST.zip'
@@ -25,8 +29,15 @@ model_path = '/content/drive/MyDrive/Projekat_Model/dodinarestauracijabest.pth'
 if not os.path.exists(model_path):
     model_path = '/content/drive/MyDrive/Projekat_Model/doroteinarestauracijabest.pth'
 
-output_dir = '/content/drive/MyDrive/Projekat_Model/EVALUACIJA_REZULTATI'
-local_extract_path = '/content/test'
+output_dir = '/content/drive/MyDrive/Projekat_Model/EVALUACIJA_REZULTATI_LAKSI'
+local_extract_path = '/content/test_laksi'
+
+# Potvrda putanja
+print("=" * 80)
+print(f"KORIŠĆEN ZIP:   {zip_path}")
+print(f"KORIŠĆEN MODEL: {model_path}")
+print(f"IZLAZNI FOLDER: {output_dir}")
+print("=" * 80)
 
 # Otpakivanje dataset-a
 if not os.path.exists(local_extract_path):
@@ -37,7 +48,7 @@ if not os.path.exists(local_extract_path):
 
 
 # =====================================================================
-# 2. MODEL RESTAURACIJE (TAČNA TRENING ARHITEKTURA)
+# 2. MODEL RESTAURACIJE
 # =====================================================================
 class DepthwiseSeparableConv2d(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, kernel_size: int = 3, padding: int = 1, dilation: int = 1):
@@ -380,7 +391,7 @@ class Restauracija(nn.Module):
         return self.contrast_color_recovery(d1_fused, input_img)
 
 
-# ostecenja
+# 3. MAPIRANJE OŠTEĆENJA
 DAMAGE_MAP = {
     'apply_anisotropic_diffusion': 'Anisotropic Diffusion (Vlaga/Zamućenje)',
     'apply_mold_and_decay': 'Mold and Decay (Buđ/Organski raspad)',
@@ -406,7 +417,7 @@ def find_dataset_folders(base_path):
     return None, None
 
 
-# glavni deo petlje
+# 4. GLAVNA EVALUACIONA PETLJA SA 4-WAY TTA
 def pokreni_evaluaciju():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Uređaj za evaluaciju: {device}")
@@ -416,25 +427,27 @@ def pokreni_evaluaciju():
     os.makedirs(pojedinacne_dir, exist_ok=True)
     os.makedirs(poredjenja_dir, exist_ok=True)
 
-    print(f" model  {model_path}")
+    print(f"Učitavam model sa: {model_path}")
     model = Restauracija(base_ch=32).to(device)
 
+    # Sigurno učitavanje sa strict=True
     checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-    model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+    state_dict = checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint
+    model.load_state_dict(state_dict, strict=True)
     model.eval()
-    print("ucitan model")
+    print("Model uspešno i strogo učitan (strict=True).")
 
     f0, f1 = find_dataset_folders(local_extract_path)
     if f0 is None or f1 is None:
         raise FileNotFoundError("Nisu pronađeni '0' i '1' folderi u test dataset-u")
 
     dmg_files = sorted([f for f in os.listdir(f1) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff'))])
-    print(f" {len(dmg_files)} oštećenih slika za testiranje.")
+    print(f"Pronađeno {len(dmg_files)} oštećenih slika za testiranje.")
 
     results_list = []
     transform_to_tensor = transforms.ToTensor()
 
-    print("\nrestauracija i analiza")
+    print("\nPokrećem restauraciju i analizu (sa 4-way TTA)...")
 
     for dmg_f in tqdm(dmg_files, desc="Evaluacija"):
         parts = dmg_f.split('_')
@@ -442,7 +455,6 @@ def pokreni_evaluaciju():
             continue
         base_name = f"{parts[0]}_{parts[1]}"
 
-        # spajanje
         clean_name = f"{base_name}_flip.jpg" if "_flip_" in dmg_f else f"{base_name}_clean.jpg"
         clean_path = os.path.join(f0, clean_name)
 
@@ -451,7 +463,6 @@ def pokreni_evaluaciju():
             clean_path = os.path.join(f0, alt_name)
 
         dmg_path = os.path.join(f1, dmg_f)
-
         if not os.path.exists(clean_path):
             continue
 
@@ -462,42 +473,48 @@ def pokreni_evaluaciju():
         clean_pil_resized = clean_pil.resize((192, 192), Image.Resampling.BILINEAR)
 
         input_tensor = transform_to_tensor(dmg_pil_resized).unsqueeze(0).to(device)
-        clean_tensor = transform_to_tensor(clean_pil_resized).unsqueeze(0).to(device)
 
         # -------------------------------------------------------------
-        # BASELINE (K1): Proračun ulaznog PSNR-a i SSIM-a (pre restauracije)
+        # 4-WAY TTA INFERENCIJA (Original, Flip H, Flip V, Rot 90)
         # -------------------------------------------------------------
-        mse_in_float = torch.mean((input_tensor - clean_tensor) ** 2).item()
-        if mse_in_float > 0:
-            psnr_in = 10.0 * np.log10(1.0 / mse_in_float)
-        else:
-            psnr_in = 100.0
+        with torch.no_grad():
+            # 1. Original
+            out_orig = model(input_tensor)
+            # 2. Horizontal flip
+            out_hf = torch.flip(model(torch.flip(input_tensor, dims=[3])), dims=[3])
+            # 3. Vertical flip
+            out_vf = torch.flip(model(torch.flip(input_tensor, dims=[2])), dims=[2])
+            # 4. Rotacija 90 stepeni
+            out_rot = torch.rot90(model(torch.rot90(input_tensor, k=1, dims=[2, 3])), k=-1, dims=[2, 3])
+
+            output_tensor = (out_orig + out_hf + out_vf + out_rot) / 4.0
+            output_tensor = torch.clamp(output_tensor, 0.0, 1.0)
 
         clean_np = np.array(clean_pil_resized)
         dmg_np = np.array(dmg_pil_resized)
-        ssim_in = ssim_metric(clean_np, dmg_np, channel_axis=2, data_range=255)
-
-        # DIREKTAN PROLAZ PREKO MREŽE (Restauracija)
-        with torch.no_grad():
-            output_tensor = model(input_tensor)
-
-        # PARALELAN PRORAČUN MODEL PSNR-a
-        mse_float = torch.mean((output_tensor - clean_tensor) ** 2).item()
-        if mse_float > 0:
-            psnr_val = 10.0 * np.log10(1.0 / mse_float)
-        else:
-            psnr_val = 100.0
 
         output_tensor_cpu = output_tensor.squeeze(0).cpu()
         restored_pil = transforms.ToPILImage()(output_tensor_cpu)
         restored_np = np.array(restored_pil)
 
+        # -------------------------------------------------------------
+        # METRIKE: Baseline (Ulaz) i Model (Restaurisano)
+        # -------------------------------------------------------------
+        psnr_in = psnr_metric(clean_np, dmg_np, data_range=255)
+        if np.isinf(psnr_in):
+            psnr_in = np.nan
+
+        ssim_in = ssim_metric(clean_np, dmg_np, channel_axis=2, data_range=255)
+
+        psnr_val = psnr_metric(clean_np, restored_np, data_range=255)
+        if np.isinf(psnr_val):
+            psnr_val = np.nan
+
         ssim_val = ssim_metric(clean_np, restored_np, channel_axis=2, data_range=255)
         mse_val = np.mean((clean_np.astype(np.float32) - restored_np.astype(np.float32)) ** 2)
         mae_val = np.mean(np.abs(clean_np.astype(np.float32) - restored_np.astype(np.float32)))
 
-        # RAČUNANJE DELTA (DOBITKA)
-        delta_psnr = psnr_val - psnr_in
+        delta_psnr = psnr_val - psnr_in if not (np.isnan(psnr_val) or np.isnan(psnr_in)) else np.nan
         delta_ssim = ssim_val - ssim_in
 
         dmg_type = detect_damage_type(dmg_f)
@@ -515,13 +532,13 @@ def pokreni_evaluaciju():
             'MAE': mae_val
         })
 
-        # Sačuvaj samostalnu restaurisanu sliku u originalnoj veličini
+        # Sačuvaj samostalnu restaurisanu sliku
         restored_original_size = restored_pil.resize(dmg_pil.size, Image.Resampling.BILINEAR)
         restored_original_size.save(os.path.join(pojedinacne_dir, f"restored_{dmg_f}"))
 
-        # Uporedni prikaz slika koje su restaurisane
+        # Uporedni vizuelni pregled
         num_saved_for_type = sum(1 for r in results_list if r['Oštećenje'] == dmg_type)
-        if num_saved_for_type <= 10:
+        if num_saved_for_type <= 5:
             bar_height = 40
             h, w, _ = restored_np.shape
             combined_img = np.zeros((h + bar_height, w * 3, 3), dtype=np.uint8)
@@ -533,15 +550,15 @@ def pokreni_evaluaciju():
             font = cv2.FONT_HERSHEY_SIMPLEX
             cv2.putText(combined_img, "OSTECENO", (10, 25), font, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
             cv2.putText(combined_img, "RESTAURISANO", (w + 10, 25), font, 0.45, (120, 255, 120), 1, cv2.LINE_AA)
-            cv2.putText(combined_img, "ORIGINALNA SLIKA", (2*w + 10, 25), font, 0.45, (255, 230, 150), 1, cv2.LINE_AA)
+            cv2.putText(combined_img, "ORIGINAL", (2*w + 10, 25), font, 0.45, (255, 230, 150), 1, cv2.LINE_AA)
 
             cv2.imwrite(os.path.join(poredjenja_dir, f"compare_{dmg_f}"), combined_img)
 
     df = pd.DataFrame(results_list)
 
-    # GRUPISANJE SA BASELINE I DELTA METRIKAMA
+    # Zbirna statistika
     statistika = df.groupby('Oštećenje').agg(
-        Broj_Slike=('Filename', 'count'),
+        Broj_Slika=('Filename', 'count'),
         Ulaz_PSNR=('PSNR_Ulaz', 'mean'),
         Restaurisan_PSNR=('PSNR_Model', 'mean'),
         ΔPSNR=('Delta_PSNR', 'mean'),
@@ -554,26 +571,17 @@ def pokreni_evaluaciju():
 
     statistika = statistika.sort_values(by='Restaurisan_PSNR', ascending=False)
 
-    csv_report_path = os.path.join(output_dir, 'izvestaj_metrika_test.csv')
+    csv_report_path = os.path.join(output_dir, 'izvestaj_metrika_test_laksi.csv')
     statistika.to_csv(csv_report_path, index=False)
 
-    PINK = '\033[38;5;205m'
-    RESET = '\033[0m'
-
-    print(f"\n\n{PINK}{'='*115}")
-    print(" EVALUACIJA USPEŠNO ZAVRŠENA")
-    print(f"{'='*115}")
-    print(f"Pojedinačne restaurisane slike sačuvane u:  {pojedinacne_dir}")
-    print(f"Uporedni primeri slika sačuvani u:          {poredjenja_dir}")
-    print(f"Tabela sačuvana na:                       {csv_report_path}\n")
-    print("="*115)
-    print("REZULTATI (ULAZ vs MODEL vs DOBITAK):")
-    print("="*115)
-
+    print(f"\n{'='*110}")
+    print(" EVALUACIJA (LAKŠI SKUP) ZAVRŠENA")
+    print(f"{'='*110}")
+    print(f"Izveštaj sačuvan na: {csv_report_path}\n")
     pd.set_option('display.max_columns', None)
     pd.set_option('display.width', 1000)
     print(statistika.to_string(index=False))
-    print("="*115 + RESET)
+    print("="*110)
 
 if __name__ == '__main__':
     pokreni_evaluaciju()
