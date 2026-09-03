@@ -742,7 +742,6 @@ if not os.path.exists(MS_REPO_DIR):
     subprocess.run(f"cd {MS_REPO_DIR}/Global && wget -q https://github.com/microsoft/Bringing-Old-Photos-Back-to-Life/releases/download/v1.0/global_checkpoints.zip && unzip -q global_checkpoints.zip", shell=True, stdout=devnull, stderr=devnull)
     subprocess.run(f"cd {MS_REPO_DIR}/Face_Detection && wget -q http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2 && bzip2 -d shape_predictor_68_face_landmarks.dat.bz2", shell=True, stdout=devnull, stderr=devnull)
 
-# Provera da li već postoje sačuvane adaptirane slike na Google Drive-u
 if len(os.listdir(DIR_NJIHOV_OUTPUT)) >= len(val_files):
     print(f"✓ [Keš] Učitavam postojeće rezultate adaptiranog Microsoft modela sa Drive-a.")
 else:
@@ -753,7 +752,6 @@ else:
     from models.models import create_model
     import argparse
 
-    # Kreiranje konfiguracije identične parametrima restauracije
     opt = argparse.Namespace()
     opt.isTrain = False
     opt.gpu_ids = [0] if torch.cuda.is_available() else []
@@ -800,7 +798,6 @@ else:
     bopbl_wrapper = create_model(opt)
     bopbl_wrapper.setup(opt)
 
-    # 5 epoha adaptacije mapping komponente
     if os.path.exists(BOPBL_FT_CKPT_DRIVE):
         print(f"✓ [Keš] Učitavam ranije adaptiran BOPBL checkpoint sa Google Drive-a...")
         bopbl_wrapper.netG.load_state_dict(torch.load(BOPBL_FT_CKPT_DRIVE, map_location=device))
@@ -817,7 +814,6 @@ else:
             ep_loss = 0.0
             for d_t, c_t, _ in train_loader:
                 d_t, c_t = d_t.to(device), c_t.to(device)
-                # Skaliranje na [-1, 1] koje očekuje BOPBL VAE
                 d_norm = d_t * 2.0 - 1.0
                 c_norm = c_t * 2.0 - 1.0
 
@@ -835,15 +831,12 @@ else:
 
             print(f"      [BOPBL Epoha {ep+1}/{EPOCHS_FINETUNE}] Loss: {ep_loss/len(train_loader):.4f}")
 
-        # Čuvanje adaptiranog checkpoint-a
         torch.save(bopbl_wrapper.netG.state_dict(), BOPBL_FT_CKPT_DRIVE)
-        # Prepisivanje checkpointa unutar Global/checkpoints kako bi run.py automatski koristio adaptiran model
         dest_ckpt_dir = os.path.join(MS_REPO_DIR, 'Global/checkpoints/restoration')
         os.makedirs(dest_ckpt_dir, exist_ok=True)
         torch.save(bopbl_wrapper.netG.state_dict(), os.path.join(dest_ckpt_dir, 'latest_net_mapping_net.pth'))
         print(f"✓ [USPEH] 5-epohno adaptirani Microsoft BOPBL model sačuvan na Drive.")
 
-    # Generisanje restaurisanih slika adaptiranim modelom
     print("-> Generisanje restaurisanih slika adaptiranim Microsoft modelom na validacionom skupu...")
     bopbl_wrapper.eval()
     for fname in val_files:
@@ -941,7 +934,7 @@ moj_s_m, moj_s_sd = get_mean_sd(raw_data_runs_1po1["Full Proposed Model"]['SSIM_
 moj_l_m, moj_l_sd = get_mean_sd(raw_data_runs_1po1["Full Proposed Model"]['LPIPS_runs'])
 
 nj_p_m, nj_p_sd = get_mean_sd(runs_njihov_psnr)
-nj_s_m, nj_s_sd = get_mean_sd(runs_njihov_psnr)
+nj_s_m, nj_s_sd = get_mean_sd(runs_njihov_ssim)  # ISPRAVLJENO: bilo runs_njihov_psnr
 nj_l_m, nj_l_sd = get_mean_sd(runs_njihov_lpips)
 
 _, p_w_p = stats.wilcoxon(moj_full_p, nj_full_p)
@@ -957,9 +950,9 @@ _, p_t_l = stats.ttest_rel(moj_full_l, nj_full_l)
 d_lpips = np.mean(moj_full_l - nj_full_l) / np.std(moj_full_l - nj_full_l, ddof=1)
 
 tabela_direktna = [
-    ['PSNR (dB) [↑]', f"{in_p_m:.2f} ± {in_p_sd:.2f}", f"{moj_p_m:.2f} ± {moj_p_sd:.2f}", f"{nj_p_m:.2f} ± {nj_p_sd:.2f}", f"+{moj_p_m - in_p_m:.2f} dB", f"+{moj_p_m - nj_p_m:.2f} dB", format_p_val(p_w_p), format_p_val(p_t_p), f"{d_psnr:.2f}"],
-    ['SSIM [↑]', f"{in_s_m:.4f} ± {in_s_sd:.4f}", f"{moj_s_m:.4f} ± {moj_s_sd:.4f}", f"{nj_s_m:.4f} ± {nj_s_sd:.4f}", f"+{moj_s_m - in_s_m:.4f}", f"+{moj_s_m - nj_s_m:.4f}", format_p_val(p_w_s), format_p_val(p_t_s), f"{d_ssim:.2f}"],
-    ['LPIPS [↓]', f"{in_l_m:.4f} ± {in_l_sd:.4f}", f"{moj_l_m:.4f} ± {moj_l_sd:.4f}", f"{nj_l_m:.4f} ± {nj_l_sd:.4f}", f"{moj_l_m - in_l_m:.4f}", f"{moj_l_m - nj_l_m:.4f}", format_p_val(p_w_l), format_p_val(p_t_l), f"{d_lpips:.2f}"]
+    ['PSNR (dB) [↑]', f"{in_p_m:.2f} ± {in_p_sd:.2f}", f"{moj_p_m:.2f} ± {moj_p_sd:.2f}", f"{nj_p_m:.2f} ± {nj_p_sd:.2f}", f"{moj_p_m - in_p_m:+.2f} dB", f"{moj_p_m - nj_p_m:+.2f} dB", format_p_val(p_w_p), format_p_val(p_t_p), f"{d_psnr:.2f}"],
+    ['SSIM [↑]', f"{in_s_m:.4f} ± {in_s_sd:.4f}", f"{moj_s_m:.4f} ± {moj_s_sd:.4f}", f"{nj_s_m:.4f} ± {nj_s_sd:.4f}", f"{moj_s_m - in_s_m:+.4f}", f"{moj_s_m - nj_s_m:+.4f}", format_p_val(p_w_s), format_p_val(p_t_s), f"{d_ssim:.2f}"],
+    ['LPIPS [↓]', f"{in_l_m:.4f} ± {in_l_sd:.4f}", f"{moj_l_m:.4f} ± {moj_l_sd:.4f}", f"{nj_l_m:.4f} ± {nj_l_sd:.4f}", f"{moj_l_m - in_l_m:+.4f}", f"{moj_l_m - nj_l_m:+.4f}", format_p_val(p_w_l), format_p_val(p_t_l), f"{d_lpips:.2f}"]
 ]
 headers_direktna = ['Metrika', 'Ulaz (Bez Rest.)', 'Predloženi Model (Mean ± SD)', 'Microsoft BOPBL (Mean ± SD)', 'Δ (vs Ulaz)', 'Δ (vs BOPBL)', 'Wilcoxon (p)', 't-test (p)', "Cohen's d"]
 
