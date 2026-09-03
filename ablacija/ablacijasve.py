@@ -15,6 +15,7 @@ import pandas as pd
 import cv2
 from scipy import stats
 from skimage.metrics import structural_similarity as ssim_metric
+from skimage.metrics import peak_signal_noise_ratio as psnr_metric
 
 warnings.filterwarnings('ignore')
 os.environ["PYTHONWARNINGS"] = "ignore"
@@ -93,7 +94,7 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 eval_lpips_fn = lpips.LPIPS(net='alex', verbose=False).to(device).eval()
 
 print(f"\n[INFO] Uređaj: {device}")
-print(f"[INFO] Trening skup: {len(os.listdir(DIR_TRAIN_DEGRADED))} | Validacioni skup: {len(os.listdir(DIR_VAL_DEGRADED))} slika\n")
+print(f"[INFO] Trening skup: {len(os.listdir(DIR_TRAIN_DEGRADED))} slika | Validacioni skup (ukupno): {len(os.listdir(DIR_VAL_DEGRADED))} slika\n")
 
 
 # ==============================================================================
@@ -151,7 +152,7 @@ class VGGPerceptualLoss(nn.Module):
 
 
 # ==============================================================================
-# ARHITEKTURA MODELA RESTAURACIJE
+# ARHITEKTURA MODELA RESTAURACIJE (NETAKNUTA)
 # ==============================================================================
 class DepthwiseSeparableConv2d(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, kernel_size: int = 3, padding: int = 1, dilation: int = 1):
@@ -529,35 +530,27 @@ class Restauracija(nn.Module):
 
 
 # ==============================================================================
-# PAMETNO UČITAVANJE CHECKPOINT-A
+# UČITAVANJE CHECKPOINT-A
 # ==============================================================================
 def ucitaj_state_dict_pametno(model, candidate_paths, device, strict=True):
     for p in candidate_paths:
         if p and os.path.exists(p):
             try:
                 ckpt = torch.load(p, map_location=device, weights_only=False)
-                if isinstance(ckpt, dict):
-                    if 'model_state_dict' in ckpt:
-                        sd = ckpt['model_state_dict']
-                    elif 'state_dict' in ckpt:
-                        sd = ckpt['state_dict']
-                    elif 'model' in ckpt:
-                        sd = ckpt['model']
-                    else:
-                        sd = ckpt
-                else:
-                    sd = ckpt
-
-                c_sd = {k.replace('module.', ''): v for k, v in sd.items()}
+                sd = ckpt['model_state_dict'] if isinstance(ckpt, dict) and 'model_state_dict' in ckpt else ckpt
+                c_sd = {k.replace('module.', ''): v for k, v in sd.items()} if isinstance(sd, dict) else sd
                 model.load_state_dict(c_sd, strict=strict)
-                print(f"✓ [USPEŠNO UČITAN CHECKPOINT] {p}")
+                print(f"✓ [USPEŠNO UČITAN BAZNI CHECKPOINT] {p}")
                 return True, p
             except Exception as e:
                 print(f"  [UPOZORENJE] Nije uspelo učitavanje {p}: {e}")
     return False, None
 
 moguce_lokacije = [DRIVE_PROJECT_DIR, '/content/drive/MyDrive', '/content', './']
-moguca_imena = ['Model_Finetuned_Final.pth', 'best_model.pth', 'model_restoration_heavy.pth', 'model_restoration_moderate.pth', 'dodinamrezajej.pth', 'model.pth', 'checkpoint.pth', 'restoration_model.pth']
+moguca_imena = [
+    'dodinarestauracijabest.pth', 'doroteinarestauracijabest.pth', 'Model_Finetuned_Final.pth',
+    'best_model.pth', 'model_restoration_heavy.pth', 'model.pth', 'checkpoint.pth'
+]
 candidate_base_ckpts = [os.path.join(loc, name) for loc in moguce_lokacije for name in moguca_imena]
 
 moj_model = Restauracija(base_ch=32).to(device)
@@ -572,7 +565,7 @@ train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_wor
 
 
 # ==============================================================================
-# STATISTIČKE I KLASTERSKE FUNKCIJE
+# STATISTIČKE I FORMAT FUNKCIJE (N4)
 # ==============================================================================
 def get_scene_id(filename):
     base = os.path.splitext(filename)[0]
@@ -589,6 +582,12 @@ def ci95(vals):
     vals = np.array(vals)
     lo, hi = np.percentile(vals, [2.5, 97.5])
     return np.mean(vals), np.std(vals), lo, hi
+
+def format_p_exact(p):
+    if p < 0.0001:
+        return f"{p:.2e}"
+    else:
+        return f"{p:.4f}"
 
 def format_p_val(p):
     if p < 0.001:
@@ -635,13 +634,13 @@ def adaptiraj_ili_ucitaj_model(base_model, cfg_name, cfg_kwargs, epochs=EPOCHS_F
 
     model_variant = copy.deepcopy(base_model).to(device)
 
-    # 1. Provera da li već postoji sačuvana adaptirana verzija na Drive-u
+    # 1. Provera keša na Drive-u
     if os.path.exists(save_path):
         print(f"   ✓ [Keš] Učitavam postojeći checkpoint sa Drive-a: {cfg_name}")
         model_variant.load_state_dict(torch.load(save_path, map_location=device), strict=True)
         return model_variant
 
-    # 2. Ako ne postoji, pokreće se 5 epoha adaptacije
+    # 2. Ako ne postoji, 5 epoha adaptacije
     print(f"   -> [Fine-tune {epochs} ep.] Adaptacija za: {cfg_name}...")
     optimizer = torch.optim.AdamW(model_variant.parameters(), lr=LR_FINETUNE, weight_decay=1e-4)
     crit_l1 = nn.L1Loss()
@@ -665,7 +664,7 @@ def adaptiraj_ili_ucitaj_model(base_model, cfg_name, cfg_kwargs, epochs=EPOCHS_F
     return model_variant
 
 cached_results = {}
-print(f"\n[INFO] Učitavanje i evaluacija svih varijanti modela...")
+print(f"\n[INFO] Evaluacija svih varijanti modela na celom validacionom skupu (N={len(val_files)})...")
 
 for naziv, cfg in ablation_configs:
     active_model = adaptiraj_ili_ucitaj_model(moj_model, naziv, cfg)
@@ -689,8 +688,10 @@ for naziv, cfg in ablation_configs:
             out_eval_t = torch.from_numpy(out_np).permute(2, 0, 1).unsqueeze(0).to(device) * 2.0 - 1.0
             c_eval_t = torch.from_numpy(c_img).permute(2, 0, 1).unsqueeze(0).to(device) * 2.0 - 1.0
 
-            mse = np.mean((c_img - out_np) ** 2)
-            psnr_val = 10.0 * np.log10(1.0 / mse) if mse > 0 else 100.0
+            psnr_val = psnr_metric(c_img, out_np, data_range=1.0)
+            if np.isinf(psnr_val):
+                psnr_val = np.nan
+
             ssim_val = ssim_metric(c_img, out_np, channel_axis=2, data_range=1.0)
             lpips_val = eval_lpips_fn(out_eval_t, c_eval_t).item()
 
@@ -717,7 +718,7 @@ for iter_idx in range(NUM_ITERACIJA):
 
 
 # ==============================================================================
-# 3. TABELA 10: REZULTATI ABLACIJE I STATISTIČKA ZNAČAJNOST
+# 3. TABELA 10: REZULTATI ABLACIJE I STATISTIČKA ZNAČAJNOST (N4 REŠENO)
 # ==============================================================================
 moj_full_p = cached_results["Full Proposed Model"]['PSNR'].values
 
@@ -756,12 +757,26 @@ for naziv, _ in ablation_configs:
 adj_p_wilcoxon = holm_bonferroni(raw_p_wilcoxon)
 adj_p_ttest = holm_bonferroni(raw_p_ttest)
 
+# Glavna tabela (Mean ± SD i 95% CI)
 headers_abl_mean = ['Konfiguracija Modela (5 Epoha Adaptacije)', 'PSNR (Mean ± SD, 95% CI) [↑]', 'SSIM (Mean ± SD, 95% CI) [↑]', 'LPIPS (Mean ± SD, 95% CI) [↓]']
+csv_tabela10_path = os.path.join(DRIVE_PROJECT_DIR, "tabela10_ablacija_mean.csv")
+pd.DataFrame(summary_abl, columns=headers_abl_mean).to_csv(csv_tabela10_path, index=False)
 pd.DataFrame(summary_abl, columns=headers_abl_mean).to_csv("tabela10.csv", index=False)
 
-stat_abl_table = []
+# Egzaktna statistička tabela sa p-vrednostima i Cohen's d
+stat_abl_table_exact = []
+stat_abl_table_terminal = []
+
 for name, d_psnr_val, p_w, p_w_adj, p_t_adj, d_val in zip(comp_names, diffs_psnr, raw_p_wilcoxon, adj_p_wilcoxon, adj_p_ttest, cohens_d_list):
-    stat_abl_table.append([
+    stat_abl_table_exact.append([
+        name,
+        f"{d_psnr_val:+.2f} dB",
+        format_p_exact(p_w),
+        format_p_exact(p_w_adj),
+        format_p_exact(p_t_adj),
+        f"{d_val:.2f}"
+    ])
+    stat_abl_table_terminal.append([
         name,
         f"{d_psnr_val:+.2f} dB",
         format_p_val(p_w),
@@ -771,57 +786,12 @@ for name, d_psnr_val, p_w, p_w_adj, p_t_adj, d_val in zip(comp_names, diffs_psnr
     ])
 
 headers_abl_stat = ['Uklonjena Komponenta', 'Δ PSNR', 'Wilcoxon (Sirovo p)', 'Wilcoxon (Holm-Bonf.)', 't-test (Holm-Bonf.)', "Cohen's d"]
+csv_stat_path = os.path.join(DRIVE_PROJECT_DIR, "tabela10_statistika.csv")
+pd.DataFrame(stat_abl_table_exact, columns=headers_abl_stat).to_csv(csv_stat_path, index=False)
 
 
 # ==============================================================================
-# 4. ANALIZA PO KATEGORIJAMA (TEST CENTRALNE HIPOTEZE)
-# ==============================================================================
-def izdvoji_kategoriju(fname):
-    fname_low = fname.lower()
-    mapa = [
-        (['pukot', 'crack'], 'Pukotine'),
-        (['bud', 'mold', 'fung'], 'Buđ i biološko propadanje'),
-        (['vlag', 'water', 'moist', 'anisotropic', 'mrlj', 'spot'], 'Vlaga i vodene mrlje'),
-        (['boja', 'peel', 'paint', 'ljusten'], 'Ljuštenje boje'),
-        (['zutilo', 'yellow', 'age', 'oxid', 'star', 'chemical', 'hemij'], 'Hemijsko starenje'),
-        (['zamuc', 'blur', 'fft', 'lowpass', 'ostrin'], 'Gubitak oštrine'),
-        (['pras', 'dust', 'ogreb', 'scratch'], 'Prašina i ogrebotine'),
-        (['komb', 'comb'], 'Kombinovano oštećenje')
-    ]
-    for kljucevi, naziv in mapa:
-        if any(k in fname_low for k in kljucevi):
-            return naziv
-    return "Ostale degradacije"
-
-df_full = cached_results["Full Proposed Model"].copy()
-df_no_spatial = cached_results["1. w/o Spatial Encoder Stream"].copy()
-df_no_spectral = cached_results["2. w/o Spectral Encoder Stream"].copy()
-
-df_full['Kategorija'] = [izdvoji_kategoriju(f) for f in df_full.index]
-df_no_spatial['Kategorija'] = [izdvoji_kategoriju(f) for f in df_no_spatial.index]
-df_no_spectral['Kategorija'] = [izdvoji_kategoriju(f) for f in df_no_spectral.index]
-
-tabela_kategorije = []
-for kat, grp in df_full.groupby('Kategorija'):
-    idx = grp.index
-    p_full = grp['PSNR'].mean()
-    p_no_spat = df_no_spatial.loc[idx]['PSNR'].mean()
-    p_no_spec = df_no_spectral.loc[idx]['PSNR'].mean()
-    tabela_kategorije.append([
-        kat, 
-        len(idx), 
-        f"{p_full:.2f} dB", 
-        f"{p_no_spat:.2f} dB", 
-        f"{p_no_spec:.2f} dB", 
-        f"{p_no_spat - p_full:+.2f} dB", 
-        f"{p_no_spec - p_full:+.2f} dB"
-    ])
-
-headers_kategorije = ['Kategorija Oštećenja', 'N Uzoraka', 'Full Model', 'w/o Spatial', 'w/o Spectral', 'Δ bez Spatial', 'Δ bez Spectral']
-
-
-# ==============================================================================
-# KONAČAN PRIKAZ U TERMINALU
+# KONAČNI PRIKAZ U TERMINALU
 # ==============================================================================
 print("\n" + "█" * 125)
 print(f"  1. ABLACIONA STUDIJA SA 5-EPOHNOM ADAPTACIJOM (N = {len(val_files)} slika, {len(unique_scenes)} scena) [Bootstrap 1000×]")
@@ -829,13 +799,10 @@ print("█" * 125)
 print(tabulate(summary_abl, headers=headers_abl_mean, tablefmt="fancy_grid", stralign="center", numalign="center"))
 
 print("\n" + "█" * 125)
-print("  2. STATISTIČKA ZNAČAJNOST ABLACIJE SA HOLM-BONFERRONI KOREKCIJOM")
+print("  2. STATISTIČKA ZNAČAJNOST SA EGZAKTNIM P-VREDNOSTIMA (Tabela 10b / N4 rešenje)")
 print("█" * 125)
-print(tabulate(stat_abl_table, headers=headers_abl_stat, tablefmt="fancy_grid", stralign="center", numalign="center"))
+print(tabulate(stat_abl_table_exact, headers=headers_abl_stat, tablefmt="fancy_grid", stralign="center", numalign="center"))
 
-print("\n" + "█" * 125)
-print("  3. TEST CENTRALNE HIPOTEZE: PROSTORNI VS SPEKTRALNI TOK PO KATEGORIJAMA")
-print("█" * 125)
-print(tabulate(tabela_kategorije, headers=headers_kategorije, tablefmt="fancy_grid", stralign="center", numalign="center"))
-
-print("\n✓ CSV fajl uspešno generisan i sačuvan: 'tabela10.csv'")
+print(f"\n✓ CSV fajlovi sačuvani na Google Drive:")
+print(f"   1. {csv_tabela10_path} (i lokalno kao 'tabela10.csv')")
+print(f"   2. {csv_stat_path}\n")
