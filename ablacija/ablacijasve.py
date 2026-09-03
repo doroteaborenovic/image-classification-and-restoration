@@ -746,66 +746,119 @@ if not os.path.exists(MS_REPO_DIR):
 if len(os.listdir(DIR_NJIHOV_OUTPUT)) >= len(val_files):
     print(f"✓ [Keš] Učitavam postojeće rezultate adaptiranog Microsoft modela sa Drive-a.")
 else:
-    # 5 epoha adaptivnog dotreniravanja za globalni BOPBL modul
     print(f"-> [Fine-tune 5 ep.] Pokrećem adaptaciju Microsoft BOPBL modela na trening skupu...")
-    sys.path.append(os.path.join(MS_REPO_DIR, 'Global'))
+    sys.path.insert(0, MS_REPO_DIR)
+    sys.path.insert(0, os.path.join(MS_REPO_DIR, 'Global'))
+    
     from models.models import create_model
+    import argparse
 
-    class OptHolder:
-        isTrain = True
-        gpu_ids = [0] if torch.cuda.is_available() else []
-        checkpoints_dir = os.path.join(MS_REPO_DIR, 'Global/checkpoints')
-        name = 'restoration'
-        resize_or_crop = 'none'
-        norm = 'batch'
-        use_vae_which_model = 'VAE_1'
-        which_model_netG = 'mapping_net'
-        model = 'mapping_model'
-        fineSize = 256
-        input_nc = 3
-        output_nc = 3
-        ngf = 64
-        nl = 'relu'
-        no_dropout = True
-        mapping_net_depth = 4
+    # Kreiranje konfiguracije identične parametrima restauracije
+    opt = argparse.Namespace()
+    opt.isTrain = False
+    opt.gpu_ids = [0] if torch.cuda.is_available() else []
+    opt.checkpoints_dir = os.path.join(MS_REPO_DIR, 'Global/checkpoints')
+    opt.name = 'restoration'
+    opt.resize_or_crop = 'none'
+    opt.norm = 'batch'
+    opt.use_vae_which_model = 'VAE_1'
+    opt.which_model_netG = 'mapping_net'
+    opt.model = 'mapping_model'
+    opt.fineSize = 256
+    opt.input_nc = 3
+    opt.output_nc = 3
+    opt.ngf = 64
+    opt.nl = 'relu'
+    opt.no_dropout = True
+    opt.mapping_net_depth = 4
+    opt.load_pretrainA = ''
+    opt.load_pretrainB = ''
+    opt.mapping_exp = 1
+    opt.NL_res = False
+    opt.use_SN = False
+    opt.correlation_renormalize = False
+    opt.NL_use_mask = False
+    opt.NL_fusion_method = 'combine'
+    opt.non_local = ''
+    opt.use_v2 = False
+    opt.mc = 64
+    opt.k_size = 4
+    opt.start_r = 1
+    opt.mapping_n_block = 6
+    opt.map_mc = 512
+    opt.spade_ic = 3
+    opt.spade_mode = 'spade'
+    opt.use_vae_which_epoch = 'latest'
+    opt.which_epoch = 'latest'
+    opt.Scratch_and_Quality_restore = False
+    opt.Quality_restore = True
+    opt.no_instance = True
+    opt.batchSize = 1
+    opt.loadSize = 256
+    opt.n_downsample_global = 3
 
-    try:
-        bopbl_opt = OptHolder()
-        bopbl_wrapper = create_model(bopbl_opt)
-        bopbl_wrapper.setup(bopbl_opt)
-        
+    bopbl_wrapper = create_model(opt)
+    bopbl_wrapper.setup(opt)
+
+    # 5 epoha adaptacije mapping komponente
+    if os.path.exists(BOPBL_FT_CKPT_DRIVE):
+        print(f"✓ [Keš] Učitavam ranije adaptiran BOPBL checkpoint sa Google Drive-a...")
+        bopbl_wrapper.netG.load_state_dict(torch.load(BOPBL_FT_CKPT_DRIVE, map_location=device))
+    else:
+        print(f"   -> Pokrećem dotreniravanje 5 epoha BOPBL generatora na vašem domenu...")
         optimizer_nj = torch.optim.AdamW(bopbl_wrapper.netG.parameters(), lr=LR_FINETUNE, weight_decay=1e-4)
         crit_l1 = nn.L1Loss()
         crit_vgg = VGGPerceptualLoss().to(device)
-        
+        bopbl_wrapper.netG_A.eval()
+        bopbl_wrapper.netG_B.eval()
+
         for ep in range(EPOCHS_FINETUNE):
             bopbl_wrapper.netG.train()
+            ep_loss = 0.0
             for d_t, c_t, _ in train_loader:
                 d_t, c_t = d_t.to(device), c_t.to(device)
+                # Skaliranje na [-1, 1] koje očekuje BOPBL VAE
+                d_norm = d_t * 2.0 - 1.0
+                c_norm = c_t * 2.0 - 1.0
+
                 optimizer_nj.zero_grad()
-                pred_nj = bopbl_wrapper.netG(d_t)
-                loss_nj = crit_l1(pred_nj, c_t) + 0.1 * crit_vgg(pred_nj, c_t)
+                with torch.no_grad():
+                    feat_A = bopbl_wrapper.netG_A(d_norm)
+                feat_B = bopbl_wrapper.netG(feat_A)
+                with torch.no_grad():
+                    pred_norm = bopbl_wrapper.netG_B(feat_B)
+
+                loss_nj = crit_l1(pred_norm, c_norm) + 0.1 * crit_vgg((pred_norm + 1.0) / 2.0, c_t)
                 loss_nj.backward()
                 optimizer_nj.step()
-                
-        # Sačuvaj adaptirani checkpoint na Drive
-        torch.save(bopbl_wrapper.netG.state_dict(), BOPBL_FT_CKPT_DRIVE)
-        print(f"✓ [USPEH] Adaptirani Microsoft BOPBL model sačuvan na Drive: {BOPBL_FT_CKPT_DRIVE}")
-    except Exception as e:
-        print(f"  [INFO] BOPBL standardna adaptacija: {e}")
+                ep_loss += loss_nj.item()
 
-    # Pokretanje inference adaptiranog modela
-    print("-> Generisanje restaurisanih slika adaptiranim Microsoft modelom...")
-    subprocess.run(
-        f"cd {MS_REPO_DIR} && python run.py --input_folder {DIR_VAL_DEGRADED} --output_folder {DIR_NJIHOV_OUTPUT} --GPU 0",
-        shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
-    
-    # Premeštanje u konačni folder ako je potrebno
-    alt_out = os.path.join(DIR_NJIHOV_OUTPUT, 'final_output')
-    if os.path.exists(alt_out) and len(os.listdir(alt_out)) > 0:
-        for fl in os.listdir(alt_out):
-            shutil.move(os.path.join(alt_out, fl), os.path.join(DIR_NJIHOV_OUTPUT, fl))
+            print(f"      [BOPBL Epoha {ep+1}/{EPOCHS_FINETUNE}] Loss: {ep_loss/len(train_loader):.4f}")
+
+        # Čuvanje adaptiranog checkpoint-a
+        torch.save(bopbl_wrapper.netG.state_dict(), BOPBL_FT_CKPT_DRIVE)
+        # Prepisivanje checkpointa unutar Global/checkpoints kako bi run.py automatski koristio adaptiran model
+        dest_ckpt_dir = os.path.join(MS_REPO_DIR, 'Global/checkpoints/restoration')
+        os.makedirs(dest_ckpt_dir, exist_ok=True)
+        torch.save(bopbl_wrapper.netG.state_dict(), os.path.join(dest_ckpt_dir, 'latest_net_mapping_net.pth'))
+        print(f"✓ [USPEH] 5-epohno adaptirani Microsoft BOPBL model sačuvan na Drive.")
+
+    # Generisanje restaurisanih slika adaptiranim modelom
+    print("-> Generisanje restaurisanih slika adaptiranim Microsoft modelom na validacionom skupu...")
+    bopbl_wrapper.eval()
+    for fname in val_files:
+        d_p = os.path.join(DIR_VAL_DEGRADED, fname)
+        if not os.path.exists(d_p):
+            continue
+        d_img = cv2.resize(cv2.cvtColor(cv2.imread(d_p), cv2.COLOR_BGR2RGB), (IMG_SIZE, IMG_SIZE)).astype(np.float32) / 255.0
+        d_norm = (torch.from_numpy(d_img).permute(2, 0, 1).unsqueeze(0).to(device) * 2.0 - 1.0).float()
+        with torch.no_grad():
+            feat_A = bopbl_wrapper.netG_A(d_norm)
+            feat_B = bopbl_wrapper.netG(feat_A)
+            pred_norm = bopbl_wrapper.netG_B(feat_B)
+            pred = torch.clamp((pred_norm + 1.0) / 2.0, 0.0, 1.0)
+            pred_np = (pred.squeeze(0).cpu().numpy().transpose(1, 2, 0) * 255.0).round().astype(np.uint8)
+            cv2.imwrite(os.path.join(DIR_NJIHOV_OUTPUT, fname), cv2.cvtColor(pred_np, cv2.COLOR_RGB2BGR))
 
 cached_njihov_results = []
 with torch.no_grad():
@@ -888,7 +941,7 @@ moj_s_m, moj_s_sd = get_mean_sd(raw_data_runs_1po1["Full Proposed Model"]['SSIM_
 moj_l_m, moj_l_sd = get_mean_sd(raw_data_runs_1po1["Full Proposed Model"]['LPIPS_runs'])
 
 nj_p_m, nj_p_sd = get_mean_sd(runs_njihov_psnr)
-nj_s_m, nj_s_sd = get_mean_sd(runs_njihov_ssim)
+nj_s_m, nj_s_sd = get_mean_sd(runs_njihov_psnr)
 nj_l_m, nj_l_sd = get_mean_sd(runs_njihov_lpips)
 
 _, p_w_p = stats.wilcoxon(moj_full_p, nj_full_p)
