@@ -21,4 +21,23 @@ Ovaj rad predstavlja celovit sistem dubokog učenja za automatsku detekciju, vi�
 
 ---
 
-## 🛠️ Struktura repozitorijuma
+##  Struktura repozitorijuma
+── klasifikacija/
+│ ├── validation1.py # Evaluacija na primarnom test skupu
+│ ├── validation2.py # Evaluacija generalizacije na nezavisnoj bazi
+│ └── validation3.py # Test robusnosti, ROC-AUC i Youden J rekalibracija
+├── restauracija/
+│ ├── generator.py # Generator 9 realističnih fizičko-hemijskih oštećenja
+│ ├── restauracija.py # Celokupan model i pipeline za treniranje (100 epoha)
+│ └── evaluacija.py # Evaluacija na test skupovima umerenog i teškog oštećenja
+├── ablacija/
+│ └── ablacijasve.py # Analiza osetljivosti (5 epoha adaptacije, Bootstrap 1000 iteracija, Holm-Bonferroni)
+├── requirements.txt # Zavisnosti projekta
+└── README.md
+
+### 1. Instalacija repozitorijuma
+```bash
+git clone https://github.com/doroteaborenovic/image-classification-and-restoration.git
+cd image-classification-and-restoration
+pip install -r requirements.txt
+
