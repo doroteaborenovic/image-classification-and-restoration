@@ -1,6 +1,6 @@
 # ==============================================================================
-# ABLACIJA 2: BEZ SPECTRAL ENCODER GRANE (w/o Spectral Encoder Stream)
-# LOSS: Kompletan originalni RestauracijaLoss (Charb + SSIM + Sobel + FFT + CustomPerceptual + Color + Freq)
+# ABLACIJA 2: BEZ SPECTRAL ENCODER GRANE (w/o Spectral Encoder Stream) - ISPRAVLJENO
+# LOSS: Kompletan originalni RestauracijaLoss (Stabilizovan za AMP + Grad Clip)
 # Protokol: 25 Epoha (Sepia Dataset) + 5 Epoha Fine-Tuning (Trening Skup) + Eval
 # ==============================================================================
 
@@ -80,7 +80,7 @@ def pronadji_glavne_foldere(tip="TRENING"):
 DIR_TRAIN_CLEAN, DIR_TRAIN_DEGRADED = pronadji_glavne_foldere("TRENING")
 DIR_VAL_CLEAN, DIR_VAL_DEGRADED = pronadji_glavne_foldere("VALIDACIJA")
 
-# Pronalaženje Sepia foldera (/train/0 i /train/1)
+# Pronalaženje Sepia foldera
 def pronadji_sepia_foldere(base_dir, fallback_clean_dir):
     for root, dirs, _ in os.walk(base_dir):
         if 'clean' in dirs and 'degraded' in dirs:
@@ -155,7 +155,7 @@ class PairedDataset(Dataset):
         return d_t, c_t, fname
 
 # ==============================================================================
-# VAŠI ORIGINALNI GUBICI (RESTAURACIJA LOSS)
+# LOSS FUNKCIJE (STABILIZOVANE ZA AMP)
 # ==============================================================================
 def gaussian(window_size: int, sigma: float) -> Tensor:
     gauss = torch.tensor([np.exp(-(x - window_size // 2) ** 2 / float(2 * sigma ** 2)) for x in range(window_size)])
@@ -189,7 +189,7 @@ class SSIMLoss(nn.Module):
 
         C1, C2 = 0.01 ** 2, 0.03 ** 2
         ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2) + 1e-6)
-        return 1.0 - ssim_map.mean()
+        return torch.clamp(1.0 - ssim_map.mean(), 0.0, 2.0)
 
 class SobelLoss(nn.Module):
     def __init__(self):
@@ -252,7 +252,10 @@ class SoftHardExampleMiningLoss(nn.Module):
 
     def forward(self, pred: Tensor, target: Tensor) -> Tensor:
         error_map = torch.abs(pred - target).mean(dim=1, keepdim=True).detach()
-        return 1.0 + torch.sigmoid((error_map - error_map.mean()) / (error_map.std() + 1e-6))
+        std = error_map.std()
+        if std < 1e-5:
+            return torch.ones_like(error_map)
+        return 1.0 + torch.sigmoid((error_map - error_map.mean()) / (std + 1e-4))
 
 class FrequencyConsistencyLoss(nn.Module):
     def __init__(self):
@@ -287,8 +290,11 @@ class RestauracijaLoss(nn.Module):
         freq_loss = self.freq_consistency(pred, target)
         color_loss = self.color_loss_fn(pred, target)
 
-        pred_fft = torch.fft.rfft2(pred, norm='ortho')
-        target_fft = torch.fft.rfft2(target, norm='ortho')
+        # FFT računamo u float32 radi izbegavanja numeričkog prelivanja u AMP
+        pred_f = pred.float()
+        target_f = target.float()
+        pred_fft = torch.fft.rfft2(pred_f, norm='ortho')
+        target_fft = torch.fft.rfft2(target_f, norm='ortho')
         fft_loss = F.l1_loss(torch.real(pred_fft), torch.real(target_fft)) + \
                    F.l1_loss(torch.imag(pred_fft), torch.imag(target_fft))
 
@@ -319,7 +325,6 @@ class RestauracijaLoss(nn.Module):
                 total_loss += 0.15 * torch.mean(torch.sqrt((pred_outputs['aux2'] - target) ** 2 + self.eps))
             return total_loss
         return self.multi_scale_loss(pred_outputs, target)
-
 
 # ==============================================================================
 # ARHITEKTURA MODELA (BEZ SPECTRAL ENCODER-A)
@@ -466,6 +471,11 @@ class ContrastColorRecovery(nn.Module):
             nn.ReLU(inplace=False),
             nn.Conv2d(in_ch // 4, out_ch * 2, 1),
         )
+        # Stabilna inicijalizacija na 0 za residualno učenje
+        nn.init.zeros_(self.local_conv[-1].weight)
+        nn.init.zeros_(self.local_conv[-1].bias)
+        nn.init.zeros_(self.global_adjust[-1].weight)
+        nn.init.zeros_(self.global_adjust[-1].bias)
 
     def forward(self, x: Tensor, input_img: Tensor) -> Tensor:
         loc = self.local_conv(x)
@@ -543,9 +553,8 @@ class Restauracija_NoSpectral(nn.Module):
 
         return self.contrast_color_recovery(fused_out, input_img)
 
-
 # ==============================================================================
-# TRENING I EVALUACIJA (SA RESTAURACIJA LOSS-OM)
+# TRENING I EVALUACIJA (SA GRADIENT CLIPPING-OM)
 # ==============================================================================
 model_no_spectral = Restauracija_NoSpectral(base_ch=32).to(device)
 
@@ -555,18 +564,17 @@ sepia_loader = DataLoader(sepia_ds, batch_size=BATCH_SIZE, shuffle=True, num_wor
 train_ds = PairedDataset(DIR_TRAIN_CLEAN, DIR_TRAIN_DEGRADED, img_size=IMG_SIZE, train=True)
 train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True)
 
-# KORISTI SE VAŠ ORIGINALNI RESTAURACIJA LOSS
 criterion = RestauracijaLoss().to(device)
 scaler = torch.amp.GradScaler('cuda')
 
-# FAZA 1: 25 EPOHA NA SEPIA DATASETU (NOVO IME CHECKPOINT-A)
-CKPT_SEPIA = os.path.join(DIR_ABLACIJA_CKPT, "ablation2_no_spectral_sepia25ep_customloss.pth")
+# FAZA 1: 25 EPOHA NA SEPIA DATASETU
+CKPT_SEPIA = os.path.join(DIR_ABLACIJA_CKPT, "ablation2_no_spectral_sepia25ep_fixed.pth")
 if os.path.exists(CKPT_SEPIA):
-    print(f"✓ [Keš] Učitavam postojeći checkpoint sa 25 epoha Sepia: {CKPT_SEPIA}")
+    print(f"✓ [Keš] Učitavam postojeći stabilni checkpoint sa 25 epoha Sepia: {CKPT_SEPIA}")
     model_no_spectral.load_state_dict(torch.load(CKPT_SEPIA, map_location=device))
 else:
     print(f"\n=======================================================")
-    print(f" FAZA 1: Trening bez Spectral grane ({EPOCHS_SEPIA} epoha na Sepia uz RestauracijaLoss)")
+    print(f" FAZA 1: Trening bez Spectral grane ({EPOCHS_SEPIA} epoha na Sepia)")
     print(f"=======================================================")
     opt_pretrain = torch.optim.AdamW(model_no_spectral.parameters(), lr=LR_PRETRAIN, weight_decay=1e-4)
     for ep in range(EPOCHS_SEPIA):
@@ -579,6 +587,11 @@ else:
                 pred = model_no_spectral(d_t)
                 loss = criterion(pred, c_t)
             scaler.scale(loss).backward()
+            
+            # Gradient clipping sprečava eksploziju
+            scaler.unscale_(opt_pretrain)
+            torch.nn.utils.clip_grad_norm_(model_no_spectral.parameters(), max_norm=1.0)
+            
             scaler.step(opt_pretrain)
             scaler.update()
             ep_loss += loss.item()
@@ -587,13 +600,13 @@ else:
     print(f"✓ Sačuvan bazni Sepia checkpoint: {CKPT_SEPIA}")
 
 # FAZA 2: 5 EPOHA FINE-TUNINGA NA TRENING SKUPU
-CKPT_FINAL = os.path.join(DIR_ABLACIJA_CKPT, "ablation2_no_spectral_final_customloss.pth")
+CKPT_FINAL = os.path.join(DIR_ABLACIJA_CKPT, "ablation2_no_spectral_final_fixed.pth")
 if os.path.exists(CKPT_FINAL):
     print(f"✓ [Keš] Učitavam finalni dotrenirani model: {CKPT_FINAL}")
     model_no_spectral.load_state_dict(torch.load(CKPT_FINAL, map_location=device))
 else:
     print(f"\n=======================================================")
-    print(f" FAZA 2: Fine-Tuning ({EPOCHS_FT} epoha na ciljnom datasetu uz RestauracijaLoss)")
+    print(f" FAZA 2: Fine-Tuning ({EPOCHS_FT} epoha na ciljnom datasetu)")
     print(f"=======================================================")
     opt_ft = torch.optim.AdamW(model_no_spectral.parameters(), lr=LR_FINETUNE, weight_decay=1e-4)
     for ep in range(EPOCHS_FT):
@@ -606,6 +619,10 @@ else:
                 pred = model_no_spectral(d_t)
                 loss = criterion(pred, c_t)
             scaler.scale(loss).backward()
+            
+            scaler.unscale_(opt_ft)
+            torch.nn.utils.clip_grad_norm_(model_no_spectral.parameters(), max_norm=1.0)
+            
             scaler.step(opt_ft)
             scaler.update()
             ep_loss += loss.item()
@@ -661,6 +678,6 @@ print("REZULTAT EVALUACIJE: ABLACIJA 2 (w/o Spectral Encoder)")
 print("="*80)
 print(tabulate(rezultati, headers=["Konfiguracija", "PSNR [↑]", "SSIM [↑]", "LPIPS [↓]"], tablefmt="fancy_grid"))
 
-csv_out = os.path.join(DRIVE_PROJECT_DIR, "rezultat_ablacija_2_no_spectral_customloss.csv")
+csv_out = os.path.join(DRIVE_PROJECT_DIR, "rezultat_ablacija_2_no_spectral_fixed.csv")
 pd.DataFrame(rezultati, columns=["Konfiguracija", "PSNR", "SSIM", "LPIPS"]).to_csv(csv_out, index=False)
 print(f"✓ Rezultat sačuvan u: {csv_out}\n")
