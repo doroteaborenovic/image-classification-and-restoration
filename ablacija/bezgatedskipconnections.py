@@ -1,5 +1,6 @@
 # ==============================================================================
 # ABLACIJA 7: BEZ GATED SKIP CONNECTIONS (w/o Gated Skip Connections)
+# LOSS: Kompletan originalni RestauracijaLoss (Charb + SSIM + Sobel + FFT + CustomPerceptual + Color + Freq)
 # Protokol: 25 Epoha (Sepia Dataset) + 5 Epoha Fine-Tuning (Trening Skup) + Eval
 # ==============================================================================
 
@@ -15,7 +16,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from torch.utils.data import Dataset, DataLoader
-from torchvision.models import vgg16, VGG16_Weights
 from skimage.metrics import structural_similarity as ssim_metric
 from skimage.metrics import peak_signal_noise_ratio as psnr_metric
 
@@ -28,7 +28,7 @@ if torch.cuda.is_available():
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
-# 1. LPIPS I TABULATE
+# 1. LPIPS I TABULATE (LPIPS služi samo za finalnu evaluaciju)
 try:
     import lpips
 except ImportError:
@@ -36,7 +36,7 @@ except ImportError:
     import lpips
 from tabulate import tabulate
 
-# 2. GOOGLE DRIVE I PUTANJE
+# 2. GOOGLE DRIVE I NOVE PUTANJE ZA ČIST TRENING
 try:
     from google.colab import drive
     drive.mount('/content/drive', force_remount=False)
@@ -45,7 +45,7 @@ except Exception:
 
 DRIVE_PROJECT_DIR = '/content/drive/MyDrive/Projekat_Model'
 os.makedirs(DRIVE_PROJECT_DIR, exist_ok=True)
-DIR_ABLACIJA_CKPT = os.path.join(DRIVE_PROJECT_DIR, 'ablacija_checkpoints_pravi')
+DIR_ABLACIJA_CKPT = os.path.join(DRIVE_PROJECT_DIR, 'ablacija_checkpoints_customloss')
 os.makedirs(DIR_ABLACIJA_CKPT, exist_ok=True)
 
 LOCAL_SEPIA_DIR = '/content/dataset_sepia'
@@ -115,7 +115,7 @@ EPOCHS_SEPIA = 25
 EPOCHS_FT = 5
 
 # ==============================================================================
-# DATASET & LOSS
+# DATASET
 # ==============================================================================
 class PairedDataset(Dataset):
     def __init__(self, clean_dir, degraded_dir, img_size=256, train=False):
@@ -154,25 +154,171 @@ class PairedDataset(Dataset):
 
         return d_t, c_t, fname
 
-class VGGPerceptualLoss(nn.Module):
+# ==============================================================================
+# VAŠI ORIGINALNI GUBICI (RESTAURACIJA LOSS)
+# ==============================================================================
+def gaussian(window_size: int, sigma: float) -> Tensor:
+    gauss = torch.tensor([np.exp(-(x - window_size // 2) ** 2 / float(2 * sigma ** 2)) for x in range(window_size)])
+    return gauss / gauss.sum()
+
+class SSIMLoss(nn.Module):
+    def __init__(self, window_size: int = 11):
+        super().__init__()
+        self.window_size = window_size
+        self.channel = 3
+        _1D_window = gaussian(window_size, 1.5).unsqueeze(1)
+        _2D_window = _1D_window.mm(_1D_window.t()).float().unsqueeze(0).unsqueeze(0)
+        self.register_buffer('window', _2D_window.expand(self.channel, 1, window_size, window_size).contiguous())
+
+    def forward(self, img1: Tensor, img2: Tensor) -> Tensor:
+        _, channel, _, _ = img1.size()
+        if channel == self.channel and self.window.data.type() == img1.data.type():
+            window = self.window
+        else:
+            _1D_window = gaussian(self.window_size, 1.5).unsqueeze(1)
+            _2D_window = _1D_window.mm(_1D_window.t()).float().unsqueeze(0).unsqueeze(0)
+            window = _2D_window.expand(channel, 1, self.window_size, self.window_size).to(img1.device)
+
+        mu1 = F.conv2d(img1, window, padding=self.window_size // 2, groups=channel)
+        mu2 = F.conv2d(img2, window, padding=self.window_size // 2, groups=channel)
+        mu1_sq, mu2_sq, mu1_mu2 = mu1.pow(2), mu2.pow(2), mu1 * mu2
+
+        sigma1_sq = F.conv2d(img1 * img1, window, padding=self.window_size // 2, groups=channel) - mu1_sq
+        sigma2_sq = F.conv2d(img2 * img2, window, padding=self.window_size // 2, groups=channel) - mu2_sq
+        sigma12 = F.conv2d(img1 * img2, window, padding=self.window_size // 2, groups=channel) - mu1_mu2
+
+        C1, C2 = 0.01 ** 2, 0.03 ** 2
+        ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2) + 1e-6)
+        return 1.0 - ssim_map.mean()
+
+class SobelLoss(nn.Module):
     def __init__(self):
         super().__init__()
-        vgg = vgg16(weights=VGG16_Weights.DEFAULT).features
-        self.slice1 = nn.Sequential(*list(vgg.children())[:4])
-        self.slice2 = nn.Sequential(*list(vgg.children())[4:9])
-        self.slice3 = nn.Sequential(*list(vgg.children())[9:16])
-        for param in self.parameters():
-            param.requires_grad = False
+        kx = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]]).unsqueeze(0).unsqueeze(0)
+        ky = torch.tensor([[-1., -2., -1.], [0., 0., 0.], [1., 2., 1.]]).unsqueeze(0).unsqueeze(0)
+        self.register_buffer('kx', kx)
+        self.register_buffer('ky', ky)
 
-    def forward(self, input: Tensor, target: Tensor) -> Tensor:
-        mean = torch.tensor([0.485, 0.456, 0.406], device=input.device).view(1, 3, 1, 1)
-        std = torch.tensor([0.229, 0.224, 0.225], device=input.device).view(1, 3, 1, 1)
-        inp = (input - mean) / std
-        tgt = (target - mean) / std
-        h1_in, h1_tgt = self.slice1(inp), self.slice1(tgt)
-        h2_in, h2_tgt = self.slice2(h1_in), self.slice2(h1_tgt)
-        h3_in, h3_tgt = self.slice3(h2_in), self.slice3(h2_tgt)
-        return F.l1_loss(h1_in, h1_tgt) + F.l1_loss(h2_in, h2_tgt) + F.l1_loss(h3_in, h3_tgt)
+    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
+        p_gray = torch.mean(pred, dim=1, keepdim=True)
+        t_gray = torch.mean(target, dim=1, keepdim=True)
+        gx_p = F.conv2d(p_gray, self.kx, padding=1)
+        gy_p = F.conv2d(p_gray, self.ky, padding=1)
+        gx_t = F.conv2d(t_gray, self.kx, padding=1)
+        gy_t = F.conv2d(t_gray, self.ky, padding=1)
+        return F.l1_loss(gx_p, gx_t) + F.l1_loss(gy_p, gy_t)
+
+class ColorLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
+        pred_blur = F.avg_pool2d(pred, kernel_size=5, stride=1, padding=2)
+        target_blur = F.avg_pool2d(target, kernel_size=5, stride=1, padding=2)
+        return F.l1_loss(pred_blur, target_blur)
+
+class CustomPerceptualLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.scales = [1, 2, 4]
+        dx = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]]).unsqueeze(0).unsqueeze(0)
+        dy = torch.tensor([[-1., -2., -1.], [0., 0., 0.], [1., 2., 1.]]).unsqueeze(0).unsqueeze(0)
+        lap = torch.tensor([[0., 1., 0.], [1., -4., 1.], [0., 1., 0.]]).unsqueeze(0).unsqueeze(0)
+        self.register_buffer('dx', dx.repeat(3, 1, 1, 1))
+        self.register_buffer('dy', dy.repeat(3, 1, 1, 1))
+        self.register_buffer('lap', lap.repeat(3, 1, 1, 1))
+
+    def extract_features(self, x: Tensor) -> list[Tensor]:
+        feats = []
+        for s in self.scales:
+            x_scaled = F.interpolate(x, scale_factor=1.0 / s, mode='bilinear', align_corners=False) if s > 1 else x
+            fx = F.conv2d(x_scaled, self.dx, padding=1, groups=3)
+            fy = F.conv2d(x_scaled, self.dy, padding=1, groups=3)
+            flap = F.conv2d(x_scaled, self.lap, padding=1, groups=3)
+            feats.extend([fx, fy, flap])
+        return feats
+
+    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
+        pred_feats = self.extract_features(pred)
+        target_feats = self.extract_features(target)
+        loss = 0.0
+        for pf, tf in zip(pred_feats, target_feats):
+            loss += F.l1_loss(pf, tf)
+        return loss / len(pred_feats)
+
+class SoftHardExampleMiningLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
+        error_map = torch.abs(pred - target).mean(dim=1, keepdim=True).detach()
+        return 1.0 + torch.sigmoid((error_map - error_map.mean()) / (error_map.std() + 1e-6))
+
+class FrequencyConsistencyLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
+        pred_low = F.avg_pool2d(pred, kernel_size=5, stride=1, padding=2)
+        tgt_low = F.avg_pool2d(target, kernel_size=5, stride=1, padding=2)
+        pred_high = pred - pred_low
+        tgt_high = target - tgt_low
+        return 0.4 * F.l1_loss(pred_low, tgt_low) + 0.6 * F.l1_loss(pred_high, tgt_high)
+
+class RestauracijaLoss(nn.Module):
+    def __init__(self, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.sobel = SobelLoss()
+        self.ssim = SSIMLoss()
+        self.perceptual = CustomPerceptualLoss()
+        self.soft_hem = SoftHardExampleMiningLoss()
+        self.freq_consistency = FrequencyConsistencyLoss()
+        self.color_loss_fn = ColorLoss()
+
+    def single_scale_loss(self, pred: Tensor, target: Tensor) -> Tensor:
+        hem_weight = self.soft_hem(pred, target)
+        char_diff = torch.sqrt((pred - target) ** 2 + self.eps)
+        char_loss = torch.mean(char_diff * hem_weight)
+
+        ssim_loss = self.ssim(pred, target)
+        edge_loss = self.sobel(pred, target)
+        percep_loss = self.perceptual(pred, target)
+        freq_loss = self.freq_consistency(pred, target)
+        color_loss = self.color_loss_fn(pred, target)
+
+        pred_fft = torch.fft.rfft2(pred, norm='ortho')
+        target_fft = torch.fft.rfft2(target, norm='ortho')
+        fft_loss = F.l1_loss(torch.real(pred_fft), torch.real(target_fft)) + \
+                   F.l1_loss(torch.imag(pred_fft), torch.imag(target_fft))
+
+        return (
+            0.40 * char_loss +
+            0.10 * ssim_loss +
+            0.10 * edge_loss +
+            0.15 * fft_loss +
+            0.10 * percep_loss +
+            0.10 * color_loss +
+            0.05 * freq_loss
+        )
+
+    def multi_scale_loss(self, pred: Tensor, target: Tensor) -> Tensor:
+        loss = self.single_scale_loss(pred, target)
+        for scale in [0.5, 0.25]:
+            p = F.interpolate(pred, scale_factor=scale, mode='bilinear', align_corners=False)
+            t = F.interpolate(target, scale_factor=scale, mode='bilinear', align_corners=False)
+            loss += scale * torch.mean(torch.sqrt((p - t) ** 2 + self.eps))
+        return loss
+
+    def forward(self, pred_outputs: Tensor | dict[str, Tensor], target: Tensor) -> Tensor:
+        if isinstance(pred_outputs, dict):
+            total_loss = self.multi_scale_loss(pred_outputs['out'], target)
+            if 'aux3' in pred_outputs:
+                total_loss += 0.3 * torch.mean(torch.sqrt((pred_outputs['aux3'] - target) ** 2 + self.eps))
+            if 'aux2' in pred_outputs:
+                total_loss += 0.15 * torch.mean(torch.sqrt((pred_outputs['aux2'] - target) ** 2 + self.eps))
+            return total_loss
+        return self.multi_scale_loss(pred_outputs, target)
 
 
 # ==============================================================================
@@ -390,20 +536,18 @@ class ContrastColorRecovery(nn.Module):
         bias = torch.tanh(bias).view(x.shape[0], -1, 1, 1) * 0.5
         return torch.clamp(input_img + loc * gain + bias, 0.0, 1.0)
 
-# GLAVNI MODEL ZA ABLACIJU 7: BEZ GATED SKIP CONNECTIONS
+# MODEL: BEZ GATED SKIP CONNECTIONS
 class Restauracija_NoGatedSkips(nn.Module):
     def __init__(self, in_channels: int = 3, out_channels: int = 3, base_ch: int = 32):
         super().__init__()
         self.edge_branch = EdgeBranch(out_channels=base_ch)
         self.edge_fusion = nn.Conv2d(base_ch * 2, base_ch, 1, bias=False)
         
-        # Spatial grana
         self.spatial_block1 = SpatialEncoderRestorationBlock(in_channels, base_ch)
         self.spatial_block2 = SpatialEncoderRestorationBlock(base_ch, base_ch * 2)
         self.spatial_block3 = SpatialEncoderRestorationBlock(base_ch * 2, base_ch * 4)
         self.spatial_block4 = SpatialEncoderRestorationBlock(base_ch * 4, base_ch * 8)
         
-        # Spectral grana
         self.spectral_init = nn.Sequential(nn.Conv2d(in_channels, base_ch, 3, padding=1, bias=False), nn.GroupNorm(4, base_ch), nn.ReLU(inplace=False))
         self.spectral_block1 = SpectralDecompositionRestorationBlock(base_ch)
         self.spectral_pool1 = nn.MaxPool2d(2)
@@ -436,7 +580,7 @@ class Restauracija_NoGatedSkips(nn.Module):
         self.decoder2 = DecoderRestorationBlock(base_ch * 2, base_ch * 2, base_ch)
         self.decoder1 = DecoderRestorationBlock(base_ch, base_ch, base_ch)
 
-        # NEMA GatedSkipConnection modula (skip_gate1, 2, 3, 4 su uklonjeni)
+        # NEMA GatedSkipConnection modula
         self.skip_refine1 = nn.Sequential(RecursiveDenseRestorationBlock(base_ch, 2), SpectralDecompositionRestorationBlock(base_ch))
         self.skip_refine2 = nn.Sequential(RecursiveDenseRestorationBlock(base_ch * 2, 2), SpectralDecompositionRestorationBlock(base_ch * 2))
         self.skip_refine3 = nn.Sequential(RecursiveDenseRestorationBlock(base_ch * 4, 2), SpectralDecompositionRestorationBlock(base_ch * 4))
@@ -470,7 +614,7 @@ class Restauracija_NoGatedSkips(nn.Module):
         c2_r = F.interpolate(c2, size=s2_skip.shape[2:], mode='bilinear', align_corners=False)
         c1_r = F.interpolate(c1, size=s1_skip.shape[2:], mode='bilinear', align_corners=False)
 
-        # BEZ GATED SKIPS: Preskočne veze se prenose direktno bez gate mehanizma
+        # BEZ GATED SKIPS: Preuzimaju se direktno
         sk4 = self.skip_refine4(s4_skip + c4_r)
         sk3 = self.skip_refine3(s3_skip + c3_r)
         sk2 = self.skip_refine2(s2_skip + c2_r)
@@ -492,7 +636,7 @@ class Restauracija_NoGatedSkips(nn.Module):
 
 
 # ==============================================================================
-# TRENING I EVALUACIJA
+# TRENING I EVALUACIJA (SA RESTAURACIJA LOSS-OM)
 # ==============================================================================
 model_no_gated_skips = Restauracija_NoGatedSkips(base_ch=32).to(device)
 
@@ -502,18 +646,18 @@ sepia_loader = DataLoader(sepia_ds, batch_size=BATCH_SIZE, shuffle=True, num_wor
 train_ds = PairedDataset(DIR_TRAIN_CLEAN, DIR_TRAIN_DEGRADED, img_size=IMG_SIZE, train=True)
 train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True)
 
-crit_l1 = nn.L1Loss()
-crit_vgg = VGGPerceptualLoss().to(device)
+# KORISTI SE VAŠ ORIGINALNI RESTAURACIJA LOSS
+criterion = RestauracijaLoss().to(device)
 scaler = torch.amp.GradScaler('cuda')
 
-# FAZA 1: 25 EPOHA NA SEPIA DATASETU
-CKPT_SEPIA = os.path.join(DIR_ABLACIJA_CKPT, "ablation_no_gatedskips_sepia25ep.pth")
+# FAZA 1: 25 EPOHA NA SEPIA DATASETU (NOVO IME CHECKPOINT-A)
+CKPT_SEPIA = os.path.join(DIR_ABLACIJA_CKPT, "ablation7_no_gatedskips_sepia25ep_customloss.pth")
 if os.path.exists(CKPT_SEPIA):
     print(f"✓ [Keš] Učitavam postojeći checkpoint sa 25 epoha Sepia: {CKPT_SEPIA}")
     model_no_gated_skips.load_state_dict(torch.load(CKPT_SEPIA, map_location=device))
 else:
     print(f"\n=======================================================")
-    print(f" FAZA 1: Trening bez Gated Skips ({EPOCHS_SEPIA} epoha na Sepia)")
+    print(f" FAZA 1: Trening bez Gated Skips ({EPOCHS_SEPIA} epoha na Sepia uz RestauracijaLoss)")
     print(f"=======================================================")
     opt_pretrain = torch.optim.AdamW(model_no_gated_skips.parameters(), lr=LR_PRETRAIN, weight_decay=1e-4)
     for ep in range(EPOCHS_SEPIA):
@@ -524,7 +668,7 @@ else:
             opt_pretrain.zero_grad()
             with torch.amp.autocast('cuda'):
                 pred = model_no_gated_skips(d_t)
-                loss = crit_l1(pred, c_t) + 0.1 * crit_vgg(pred, c_t)
+                loss = criterion(pred, c_t)
             scaler.scale(loss).backward()
             scaler.step(opt_pretrain)
             scaler.update()
@@ -534,13 +678,13 @@ else:
     print(f"✓ Sačuvan bazni Sepia checkpoint: {CKPT_SEPIA}")
 
 # FAZA 2: 5 EPOHA FINE-TUNINGA NA TRENING SKUPU
-CKPT_FINAL = os.path.join(DIR_ABLACIJA_CKPT, "ablation_no_gatedskips_final.pth")
+CKPT_FINAL = os.path.join(DIR_ABLACIJA_CKPT, "ablation7_no_gatedskips_final_customloss.pth")
 if os.path.exists(CKPT_FINAL):
     print(f"✓ [Keš] Učitavam finalni dotrenirani model: {CKPT_FINAL}")
     model_no_gated_skips.load_state_dict(torch.load(CKPT_FINAL, map_location=device))
 else:
     print(f"\n=======================================================")
-    print(f" FAZA 2: Fine-Tuning ({EPOCHS_FT} epoha na ciljnom datasetu)")
+    print(f" FAZA 2: Fine-Tuning ({EPOCHS_FT} epoha na ciljnom datasetu uz RestauracijaLoss)")
     print(f"=======================================================")
     opt_ft = torch.optim.AdamW(model_no_gated_skips.parameters(), lr=LR_FINETUNE, weight_decay=1e-4)
     for ep in range(EPOCHS_FT):
@@ -551,7 +695,7 @@ else:
             opt_ft.zero_grad()
             with torch.amp.autocast('cuda'):
                 pred = model_no_gated_skips(d_t)
-                loss = crit_l1(pred, c_t) + 0.1 * crit_vgg(pred, c_t)
+                loss = criterion(pred, c_t)
             scaler.scale(loss).backward()
             scaler.step(opt_ft)
             scaler.update()
@@ -608,6 +752,6 @@ print("REZULTAT EVALUACIJE: ABLACIJA 7 (w/o Gated Skip Connections)")
 print("="*80)
 print(tabulate(rezultati, headers=["Konfiguracija", "PSNR [↑]", "SSIM [↑]", "LPIPS [↓]"], tablefmt="fancy_grid"))
 
-csv_out = os.path.join(DRIVE_PROJECT_DIR, "rezultat_ablacija_7_no_gatedskips.csv")
+csv_out = os.path.join(DRIVE_PROJECT_DIR, "rezultat_ablacija_7_no_gatedskips_customloss.csv")
 pd.DataFrame(rezultati, columns=["Konfiguracija", "PSNR", "SSIM", "LPIPS"]).to_csv(csv_out, index=False)
 print(f"✓ Rezultat sačuvan u: {csv_out}\n")
