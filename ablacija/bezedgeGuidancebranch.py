@@ -1,6 +1,6 @@
 # ==============================================================================
-# ABLACIJA 9: BEZ EDGE GUIDANCE GRANE (w/o Edge Guidance Branch)
-# LOSS: Kompletan originalni RestauracijaLoss (Charb + SSIM + Sobel + FFT + CustomPerceptual + Color + Freq)
+# ABLACIJA 9: BEZ EDGE GUIDANCE GRANE (w/o Edge Guidance Branch) - STABILIZOVANO
+# LOSS: Kompletan stabilizovani RestauracijaLoss (AMP safe + Grad Clip + Scheduler)
 # Protokol: 25 Epoha (Sepia Dataset) + 5 Epoha Fine-Tuning (Trening Skup) + Eval
 # ==============================================================================
 
@@ -108,37 +108,37 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 eval_lpips_fn = lpips.LPIPS(net='alex', verbose=False).to(device).eval()
 
 BATCH_SIZE = 4
-LR_PRETRAIN = 2e-4
-LR_FINETUNE = 5e-5
+LR_PRETRAIN = 1e-4
+LR_FINETUNE = 3e-5
 IMG_SIZE = 256
 EPOCHS_SEPIA = 25
 EPOCHS_FT = 5
 
 # ==============================================================================
-# DATASET
+# DATASET (SA SIGURNIM UPARIVANJEM)
 # ==============================================================================
 class PairedDataset(Dataset):
     def __init__(self, clean_dir, degraded_dir, img_size=256, train=False):
         self.clean_dir = clean_dir
         self.degraded_dir = degraded_dir
-        d_files = set(os.listdir(degraded_dir))
-        c_files = set(os.listdir(clean_dir))
-        self.files = sorted([f for f in (d_files & c_files) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
-        if len(self.files) == 0:
-            self.files = sorted([f for f in os.listdir(degraded_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
         self.img_size = img_size
         self.train = train
 
+        c_all = sorted([f for f in os.listdir(clean_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
+        d_all = sorted([f for f in os.listdir(degraded_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
+
+        common = sorted(list(set(c_all) & set(d_all)))
+        if len(common) > 0:
+            self.pairs = [(os.path.join(clean_dir, f), os.path.join(degraded_dir, f), f) for f in common]
+        else:
+            min_len = min(len(c_all), len(d_all))
+            self.pairs = [(os.path.join(clean_dir, c_all[i]), os.path.join(degraded_dir, d_all[i]), d_all[i]) for i in range(min_len)]
+
     def __len__(self):
-        return len(self.files)
+        return len(self.pairs)
 
     def __getitem__(self, idx):
-        fname = self.files[idx]
-        c_p = os.path.join(self.clean_dir, fname)
-        d_p = os.path.join(self.degraded_dir, fname)
-
-        if not os.path.exists(c_p):
-            c_p = os.path.join(self.clean_dir, os.listdir(self.clean_dir)[idx % len(os.listdir(self.clean_dir))])
+        c_p, d_p, fname = self.pairs[idx]
 
         c_img = cv2.resize(cv2.cvtColor(cv2.imread(c_p), cv2.COLOR_BGR2RGB), (self.img_size, self.img_size))
         d_img = cv2.resize(cv2.cvtColor(cv2.imread(d_p), cv2.COLOR_BGR2RGB), (self.img_size, self.img_size))
@@ -155,7 +155,7 @@ class PairedDataset(Dataset):
         return d_t, c_t, fname
 
 # ==============================================================================
-# VAŠI ORIGINALNI GUBICI (RESTAURACIJA LOSS)
+# LOSS FUNKCIJE (STABILIZOVANE ZA AMP)
 # ==============================================================================
 def gaussian(window_size: int, sigma: float) -> Tensor:
     gauss = torch.tensor([np.exp(-(x - window_size // 2) ** 2 / float(2 * sigma ** 2)) for x in range(window_size)])
@@ -189,7 +189,7 @@ class SSIMLoss(nn.Module):
 
         C1, C2 = 0.01 ** 2, 0.03 ** 2
         ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2) + 1e-6)
-        return 1.0 - ssim_map.mean()
+        return torch.clamp(1.0 - ssim_map.mean(), 0.0, 2.0)
 
 class SobelLoss(nn.Module):
     def __init__(self):
@@ -252,7 +252,10 @@ class SoftHardExampleMiningLoss(nn.Module):
 
     def forward(self, pred: Tensor, target: Tensor) -> Tensor:
         error_map = torch.abs(pred - target).mean(dim=1, keepdim=True).detach()
-        return 1.0 + torch.sigmoid((error_map - error_map.mean()) / (error_map.std() + 1e-6))
+        std = error_map.std()
+        if std < 1e-5:
+            return torch.ones_like(error_map)
+        return 1.0 + torch.sigmoid((error_map - error_map.mean()) / (std + 1e-4))
 
 class FrequencyConsistencyLoss(nn.Module):
     def __init__(self):
@@ -287,16 +290,19 @@ class RestauracijaLoss(nn.Module):
         freq_loss = self.freq_consistency(pred, target)
         color_loss = self.color_loss_fn(pred, target)
 
-        pred_fft = torch.fft.rfft2(pred, norm='ortho')
-        target_fft = torch.fft.rfft2(target, norm='ortho')
+        # FFT računamo u float32
+        pred_f = pred.float()
+        target_f = target.float()
+        pred_fft = torch.fft.rfft2(pred_f, norm='ortho')
+        target_fft = torch.fft.rfft2(target_f, norm='ortho')
         fft_loss = F.l1_loss(torch.real(pred_fft), torch.real(target_fft)) + \
                    F.l1_loss(torch.imag(pred_fft), torch.imag(target_fft))
 
         return (
             0.40 * char_loss +
-            0.10 * ssim_loss +
+            0.15 * ssim_loss +
             0.10 * edge_loss +
-            0.15 * fft_loss +
+            0.10 * fft_loss +
             0.10 * percep_loss +
             0.10 * color_loss +
             0.05 * freq_loss
@@ -319,7 +325,6 @@ class RestauracijaLoss(nn.Module):
                 total_loss += 0.15 * torch.mean(torch.sqrt((pred_outputs['aux2'] - target) ** 2 + self.eps))
             return total_loss
         return self.multi_scale_loss(pred_outputs, target)
-
 
 # ==============================================================================
 # ARHITEKTURA MODELA (BEZ EDGE GUIDANCE GRANE)
@@ -347,7 +352,7 @@ class RecursiveDenseRestorationBlock(nn.Module):
         for _ in range(self.num_recursions):
             out = F.relu(self.gn(self.conv(out)) + x)
             outputs.append(out)
-        return self.fusion(torch.cat(outputs, dim=1))
+        return self.fusion(torch.cat(outputs, dim=1)) + x
 
 class SpectralDecompositionRestorationBlock(nn.Module):
     def __init__(self, channels: int):
@@ -506,34 +511,28 @@ class GatedSkipConnection(nn.Module):
     def forward(self, skip: Tensor) -> Tensor:
         return skip * self.gate(skip)
 
+# POTPUNO STABILIZOVAN RESIDUAL RECOVERY
 class ContrastColorRecovery(nn.Module):
     def __init__(self, in_ch: int, out_ch: int = 3):
         super().__init__()
-        self.local_conv = nn.Sequential(
+        self.conv = nn.Sequential(
             nn.Conv2d(in_ch, in_ch // 2, 3, padding=1, bias=False),
             nn.GroupNorm(4, in_ch // 2),
-            nn.ReLU(inplace=False),
+            nn.LeakyReLU(0.2, inplace=False),
             nn.Conv2d(in_ch // 2, out_ch, 3, padding=1)
         )
-        self.global_adjust = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(in_ch, in_ch // 4, 1, bias=False),
-            nn.ReLU(inplace=False),
-            nn.Conv2d(in_ch // 4, out_ch * 2, 1),
-        )
+        nn.init.zeros_(self.conv[-1].weight)
+        nn.init.zeros_(self.conv[-1].bias)
 
     def forward(self, x: Tensor, input_img: Tensor) -> Tensor:
-        loc = self.local_conv(x)
-        gain, bias = torch.chunk(self.global_adjust(x), 2, dim=1)
-        gain = torch.sigmoid(gain).view(x.shape[0], -1, 1, 1) * 2.0
-        bias = torch.tanh(bias).view(x.shape[0], -1, 1, 1) * 0.5
-        return torch.clamp(input_img + loc * gain + bias, 0.0, 1.0)
+        residual = self.conv(x)
+        return torch.clamp(input_img + residual, 0.0, 1.0)
 
 # GLAVNI MODEL ZA ABLACIJU 9: BEZ EDGE GUIDANCE GRANE
 class Restauracija_NoEdgeBranch(nn.Module):
     def __init__(self, in_channels: int = 3, out_channels: int = 3, base_ch: int = 32):
         super().__init__()
-        # NEMA self.edge_branch NITI self.edge_fusion
+        # NEMA EdgeBranch niti EdgeFusion modula
         self.spatial_block1 = SpatialEncoderRestorationBlock(in_channels, base_ch)
         self.spatial_block2 = SpatialEncoderRestorationBlock(base_ch, base_ch * 2)
         self.spatial_block3 = SpatialEncoderRestorationBlock(base_ch * 2, base_ch * 4)
@@ -622,13 +621,12 @@ class Restauracija_NoEdgeBranch(nn.Module):
         if d1.shape[2:] != input_img.shape[2:]:
             d1 = F.interpolate(d1, size=input_img.shape[2:], mode='bilinear', align_corners=False)
 
-        # BEZ EDGE BRANCH: Izlaz final_refinement-a direktno ide u CCR
         refined = self.final_refinement(d1)
+        # Direktno u ContrastColorRecovery bez Edge grane
         return self.contrast_color_recovery(refined, input_img)
 
-
 # ==============================================================================
-# TRENING I EVALUACIJA (SA RESTAURACIJA LOSS-OM)
+# TRENING I EVALUACIJA (SA SCHEDULER-OM I GRADIENT CLIPPING-OM)
 # ==============================================================================
 model_no_edge = Restauracija_NoEdgeBranch(base_ch=32).to(device)
 
@@ -638,20 +636,23 @@ sepia_loader = DataLoader(sepia_ds, batch_size=BATCH_SIZE, shuffle=True, num_wor
 train_ds = PairedDataset(DIR_TRAIN_CLEAN, DIR_TRAIN_DEGRADED, img_size=IMG_SIZE, train=True)
 train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True)
 
-# KORISTI SE VAŠ ORIGINALNI RESTAURACIJA LOSS
 criterion = RestauracijaLoss().to(device)
 scaler = torch.amp.GradScaler('cuda')
 
-# FAZA 1: 25 EPOHA NA SEPIA DATASETU (NOVO IME CHECKPOINT-A)
-CKPT_SEPIA = os.path.join(DIR_ABLACIJA_CKPT, "ablation9_no_edgebranch_sepia25ep_customloss.pth")
+CKPT_SEPIA = os.path.join(DIR_ABLACIJA_CKPT, "ablation9_no_edgebranch_sepia25ep_v2.pth")
+CKPT_FINAL = os.path.join(DIR_ABLACIJA_CKPT, "ablation9_no_edgebranch_final_v2.pth")
+
+# FAZA 1: 25 EPOHA NA SEPIA DATASETU
 if os.path.exists(CKPT_SEPIA):
-    print(f"✓ [Keš] Učitavam postojeći checkpoint sa 25 epoha Sepia: {CKPT_SEPIA}")
+    print(f"✓ [Keš] Učitavam postojeći stabilni Sepia checkpoint: {CKPT_SEPIA}")
     model_no_edge.load_state_dict(torch.load(CKPT_SEPIA, map_location=device))
 else:
     print(f"\n=======================================================")
-    print(f" FAZA 1: Trening bez Edge grane ({EPOCHS_SEPIA} epoha na Sepia uz RestauracijaLoss)")
+    print(f" FAZA 1: Trening bez Edge grane ({EPOCHS_SEPIA} epoha na Sepia)")
     print(f"=======================================================")
     opt_pretrain = torch.optim.AdamW(model_no_edge.parameters(), lr=LR_PRETRAIN, weight_decay=1e-4)
+    scheduler_pretrain = torch.optim.lr_scheduler.CosineAnnealingLR(opt_pretrain, T_max=EPOCHS_SEPIA, eta_min=1e-6)
+    
     for ep in range(EPOCHS_SEPIA):
         model_no_edge.train()
         ep_loss = 0.0
@@ -662,23 +663,29 @@ else:
                 pred = model_no_edge(d_t)
                 loss = criterion(pred, c_t)
             scaler.scale(loss).backward()
+            
+            scaler.unscale_(opt_pretrain)
+            torch.nn.utils.clip_grad_norm_(model_no_edge.parameters(), max_norm=1.0)
+            
             scaler.step(opt_pretrain)
             scaler.update()
             ep_loss += loss.item()
-        print(f" [Sepia Epoha {ep+1:02d}/{EPOCHS_SEPIA}] Loss: {ep_loss/len(sepia_loader):.4f}")
+        scheduler_pretrain.step()
+        print(f" [Sepia Epoha {ep+1:02d}/{EPOCHS_SEPIA}] Loss: {ep_loss/len(sepia_loader):.4f} | LR: {scheduler_pretrain.get_last_lr()[0]:.2e}")
     torch.save(model_no_edge.state_dict(), CKPT_SEPIA)
-    print(f"✓ Sačuvan bazni Sepia checkpoint: {CKPT_SEPIA}")
+    print(f"✓ Sačuvan Sepia checkpoint: {CKPT_SEPIA}")
 
 # FAZA 2: 5 EPOHA FINE-TUNINGA NA TRENING SKUPU
-CKPT_FINAL = os.path.join(DIR_ABLACIJA_CKPT, "ablation9_no_edgebranch_final_customloss.pth")
 if os.path.exists(CKPT_FINAL):
     print(f"✓ [Keš] Učitavam finalni dotrenirani model: {CKPT_FINAL}")
     model_no_edge.load_state_dict(torch.load(CKPT_FINAL, map_location=device))
 else:
     print(f"\n=======================================================")
-    print(f" FAZA 2: Fine-Tuning ({EPOCHS_FT} epoha na ciljnom datasetu uz RestauracijaLoss)")
+    print(f" FAZA 2: Fine-Tuning ({EPOCHS_FT} epoha na ciljnom datasetu)")
     print(f"=======================================================")
     opt_ft = torch.optim.AdamW(model_no_edge.parameters(), lr=LR_FINETUNE, weight_decay=1e-4)
+    scheduler_ft = torch.optim.lr_scheduler.CosineAnnealingLR(opt_ft, T_max=EPOCHS_FT, eta_min=1e-6)
+    
     for ep in range(EPOCHS_FT):
         model_no_edge.train()
         ep_loss = 0.0
@@ -689,10 +696,15 @@ else:
                 pred = model_no_edge(d_t)
                 loss = criterion(pred, c_t)
             scaler.scale(loss).backward()
+            
+            scaler.unscale_(opt_ft)
+            torch.nn.utils.clip_grad_norm_(model_no_edge.parameters(), max_norm=1.0)
+            
             scaler.step(opt_ft)
             scaler.update()
             ep_loss += loss.item()
-        print(f" [Fine-Tune Epoha {ep+1:02d}/{EPOCHS_FT}] Loss: {ep_loss/len(train_loader):.4f}")
+        scheduler_ft.step()
+        print(f" [Fine-Tune Epoha {ep+1:02d}/{EPOCHS_FT}] Loss: {ep_loss/len(train_loader):.4f} | LR: {scheduler_ft.get_last_lr()[0]:.2e}")
     torch.save(model_no_edge.state_dict(), CKPT_FINAL)
     print(f"✓ Sačuvan finalni model: {CKPT_FINAL}")
 
@@ -744,6 +756,6 @@ print("REZULTAT EVALUACIJE: ABLACIJA 9 (w/o Edge Guidance Branch)")
 print("="*80)
 print(tabulate(rezultati, headers=["Konfiguracija", "PSNR [↑]", "SSIM [↑]", "LPIPS [↓]"], tablefmt="fancy_grid"))
 
-csv_out = os.path.join(DRIVE_PROJECT_DIR, "rezultat_ablacija_9_no_edgebranch_customloss.csv")
+csv_out = os.path.join(DRIVE_PROJECT_DIR, "rezultat_ablacija_9_no_edgebranch_v2.csv")
 pd.DataFrame(rezultati, columns=["Konfiguracija", "PSNR", "SSIM", "LPIPS"]).to_csv(csv_out, index=False)
 print(f"✓ Rezultat sačuvan u: {csv_out}\n")
