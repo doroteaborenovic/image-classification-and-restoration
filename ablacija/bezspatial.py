@@ -1,7 +1,7 @@
 # ==============================================================================
 # ABLACIJA 1: BEZ SPATIAL ENCODER GRANE (w/o Spatial Encoder Stream)
-# LOSS: Kompletan originalni RestauracijaLoss (Charb + SSIM + Sobel + FFT + CustomPerceptual + Color + Freq)
-# Protokol: 25 Epoha (Sepia Dataset) + 5 Epoha Fine-Tuning (Trening Skup) + Eval
+# LOSS: Kompletan originalni RestauracijaLoss
+# Protokol: Nastavak +5 Epoha (Sepia do 30) + +5 Epoha Fine-Tuning (do 10) + Eval
 # ==============================================================================
 
 import os
@@ -80,7 +80,7 @@ def pronadji_glavne_foldere(tip="TRENING"):
 DIR_TRAIN_CLEAN, DIR_TRAIN_DEGRADED = pronadji_glavne_foldere("TRENING")
 DIR_VAL_CLEAN, DIR_VAL_DEGRADED = pronadji_glavne_foldere("VALIDACIJA")
 
-# Pronalaženje Sepia foldera (/train/0 i /train/1)
+# Pronalaženje Sepia foldera
 def pronadji_sepia_foldere(base_dir, fallback_clean_dir):
     for root, dirs, _ in os.walk(base_dir):
         if 'clean' in dirs and 'degraded' in dirs:
@@ -111,8 +111,10 @@ BATCH_SIZE = 4
 LR_PRETRAIN = 2e-4
 LR_FINETUNE = 5e-5
 IMG_SIZE = 256
-EPOCHS_SEPIA = 25
-EPOCHS_FT = 5
+
+# Ukupne epohe
+TARGET_EPOCHS_SEPIA = 30  # 25 prethodnih + 5 novih
+TARGET_EPOCHS_FT = 10     # 5 prethodnih + 5 novih
 
 # ==============================================================================
 # DATASET
@@ -155,7 +157,7 @@ class PairedDataset(Dataset):
         return d_t, c_t, fname
 
 # ==============================================================================
-# VAŠI ORIGINALNI GUBICI (RESTAURACIJA LOSS)
+# LOSS FUNKCIJE
 # ==============================================================================
 def gaussian(window_size: int, sigma: float) -> Tensor:
     gauss = torch.tensor([np.exp(-(x - window_size // 2) ** 2 / float(2 * sigma ** 2)) for x in range(window_size)])
@@ -489,7 +491,7 @@ class ContrastColorRecovery(nn.Module):
         bias = torch.tanh(bias).view(x.shape[0], -1, 1, 1) * 0.5
         return torch.clamp(input_img + loc * gain + bias, 0.0, 1.0)
 
-# GLAVNI MODEL: SAMO SPECTRAL GRANA
+# GLAVNI MODEL
 class Restauracija_NoSpatial(nn.Module):
     def __init__(self, in_channels: int = 3, out_channels: int = 3, base_ch: int = 32):
         super().__init__()
@@ -567,7 +569,7 @@ class Restauracija_NoSpatial(nn.Module):
 
 
 # ==============================================================================
-# TRENING I EVALUACIJA (SA RESTAURACIJA LOSS-OM)
+# TRENING I EVALUACIJA (NASTAVAK + EVALUACIJA)
 # ==============================================================================
 model_no_spatial = Restauracija_NoSpatial(base_ch=32).to(device)
 
@@ -577,21 +579,34 @@ sepia_loader = DataLoader(sepia_ds, batch_size=BATCH_SIZE, shuffle=True, num_wor
 train_ds = PairedDataset(DIR_TRAIN_CLEAN, DIR_TRAIN_DEGRADED, img_size=IMG_SIZE, train=True)
 train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True)
 
-# KORISTI SE VAŠ ORIGINALNI RESTAURACIJA LOSS
 criterion = RestauracijaLoss().to(device)
 scaler = torch.amp.GradScaler('cuda')
 
-# FAZA 1: 25 EPOHA NA SEPIA DATASETU
-CKPT_SEPIA = os.path.join(DIR_ABLACIJA_CKPT, "ablation1_no_spatial_sepia25ep_customloss.pth")
-if os.path.exists(CKPT_SEPIA):
-    print(f"✓ [Keš] Učitavam postojeći checkpoint sa 25 epoha Sepia: {CKPT_SEPIA}")
-    model_no_spatial.load_state_dict(torch.load(CKPT_SEPIA, map_location=device))
+CKPT_SEPIA_OLD = os.path.join(DIR_ABLACIJA_CKPT, "ablation1_no_spatial_sepia25ep_customloss.pth")
+CKPT_SEPIA_30 = os.path.join(DIR_ABLACIJA_CKPT, "ablation1_no_spatial_sepia30ep_customloss.pth")
+
+CKPT_FINAL_OLD = os.path.join(DIR_ABLACIJA_CKPT, "ablation1_no_spatial_final_customloss.pth")
+CKPT_FINAL_10 = os.path.join(DIR_ABLACIJA_CKPT, "ablation1_no_spatial_final_10ep_customloss.pth")
+
+# ------------------------------------------------------------------------------
+# FAZA 1: DOKONČAVANJE SEPIA PRE-TRAININGA (+5 epoha, od 26 do 30)
+# ------------------------------------------------------------------------------
+if os.path.exists(CKPT_SEPIA_30):
+    print(f"✓ [Keš] Učitavam postojeći checkpoint sa 30 epoha Sepia: {CKPT_SEPIA_30}")
+    model_no_spatial.load_state_dict(torch.load(CKPT_SEPIA_30, map_location=device))
 else:
+    start_ep_sepia = 0
+    if os.path.exists(CKPT_SEPIA_OLD):
+        print(f"✓ [Nastavak] Učitavam prethodnih 25 epoha: {CKPT_SEPIA_OLD}")
+        model_no_spatial.load_state_dict(torch.load(CKPT_SEPIA_OLD, map_location=device))
+        start_ep_sepia = 25  # nastavljamo od 26. epohe
+    
     print(f"\n=======================================================")
-    print(f" FAZA 1: Trening bez Spatial grane ({EPOCHS_SEPIA} epoha na Sepia uz RestauracijaLoss)")
+    print(f" FAZA 1: Trening na Sepia datasetu (Epohe {start_ep_sepia+1} -> {TARGET_EPOCHS_SEPIA})")
     print(f"=======================================================")
+    
     opt_pretrain = torch.optim.AdamW(model_no_spatial.parameters(), lr=LR_PRETRAIN, weight_decay=1e-4)
-    for ep in range(EPOCHS_SEPIA):
+    for ep in range(start_ep_sepia, TARGET_EPOCHS_SEPIA):
         model_no_spatial.train()
         ep_loss = 0.0
         for d_t, c_t, _ in sepia_loader:
@@ -604,21 +619,32 @@ else:
             scaler.step(opt_pretrain)
             scaler.update()
             ep_loss += loss.item()
-        print(f" [Sepia Epoha {ep+1:02d}/{EPOCHS_SEPIA}] Loss: {ep_loss/len(sepia_loader):.4f}")
-    torch.save(model_no_spatial.state_dict(), CKPT_SEPIA)
-    print(f"✓ Sačuvan bazni Sepia checkpoint: {CKPT_SEPIA}")
+        print(f" [Sepia Epoha {ep+1:02d}/{TARGET_EPOCHS_SEPIA}] Loss: {ep_loss/len(sepia_loader):.4f}")
+    
+    torch.save(model_no_spatial.state_dict(), CKPT_SEPIA_30)
+    print(f"✓ Sačuvan produženi Sepia checkpoint (30 epoha): {CKPT_SEPIA_30}")
 
-# FAZA 2: 5 EPOHA FINE-TUNINGA NA TRENING SKUPU
-CKPT_FINAL = os.path.join(DIR_ABLACIJA_CKPT, "ablation1_no_spatial_final_customloss.pth")
-if os.path.exists(CKPT_FINAL):
-    print(f"✓ [Keš] Učitavam finalni dotrenirani model: {CKPT_FINAL}")
-    model_no_spatial.load_state_dict(torch.load(CKPT_FINAL, map_location=device))
+# ------------------------------------------------------------------------------
+# FAZA 2: DOKONČAVANJE FINE-TUNINGA (+5 epoha, od 6 do 10)
+# ------------------------------------------------------------------------------
+if os.path.exists(CKPT_FINAL_10):
+    print(f"✓ [Keš] Učitavam finalni model sa 10 epoha FT: {CKPT_FINAL_10}")
+    model_no_spatial.load_state_dict(torch.load(CKPT_FINAL_10, map_location=device))
 else:
+    start_ep_ft = 0
+    if os.path.exists(CKPT_FINAL_OLD):
+        print(f"✓ [Nastavak] Učitavam postojeći 5-epoha fine-tuned model: {CKPT_FINAL_OLD}")
+        model_no_spatial.load_state_dict(torch.load(CKPT_FINAL_OLD, map_location=device))
+        start_ep_ft = 5  # nastavljamo od 6. epohe
+    else:
+        print(f"[INFO] Počinjem fine-tuning od nule koristeći Sepia model...")
+
     print(f"\n=======================================================")
-    print(f" FAZA 2: Fine-Tuning ({EPOCHS_FT} epoha na ciljnom datasetu uz RestauracijaLoss)")
+    print(f" FAZA 2: Fine-Tuning na ciljnom datasetu (Epohe {start_ep_ft+1} -> {TARGET_EPOCHS_FT})")
     print(f"=======================================================")
+    
     opt_ft = torch.optim.AdamW(model_no_spatial.parameters(), lr=LR_FINETUNE, weight_decay=1e-4)
-    for ep in range(EPOCHS_FT):
+    for ep in range(start_ep_ft, TARGET_EPOCHS_FT):
         model_no_spatial.train()
         ep_loss = 0.0
         for d_t, c_t, _ in train_loader:
@@ -631,12 +657,15 @@ else:
             scaler.step(opt_ft)
             scaler.update()
             ep_loss += loss.item()
-        print(f" [Fine-Tune Epoha {ep+1:02d}/{EPOCHS_FT}] Loss: {ep_loss/len(train_loader):.4f}")
-    torch.save(model_no_spatial.state_dict(), CKPT_FINAL)
-    print(f"✓ Sačuvan finalni model: {CKPT_FINAL}")
+        print(f" [Fine-Tune Epoha {ep+1:02d}/{TARGET_EPOCHS_FT}] Loss: {ep_loss/len(train_loader):.4f}")
+    
+    torch.save(model_no_spatial.state_dict(), CKPT_FINAL_10)
+    print(f"✓ Sačuvan finalni model (10 epoha FT): {CKPT_FINAL_10}")
 
+# ------------------------------------------------------------------------------
 # FAZA 3: EVALUACIJA NA VALIDACIJI
-print(f"\n[INFO] Evaluacija modela (w/o Spatial Encoder) na validaciji...")
+# ------------------------------------------------------------------------------
+print(f"\n[INFO] Evaluacija modela (w/o Spatial Encoder, 30ep Sepia + 10ep FT) na validaciji...")
 model_no_spatial.eval()
 val_files = sorted([f for f in os.listdir(DIR_VAL_DEGRADED) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
 
@@ -672,7 +701,7 @@ s_m, s_sd = np.mean(ssim_list), np.std(ssim_list)
 l_m, l_sd = np.mean(lpips_list), np.std(lpips_list)
 
 rezultati = [[
-    "1. w/o Spatial Encoder Stream",
+    "1. w/o Spatial Encoder Stream (30ep Sepia + 10ep FT)",
     f"{p_m:.2f} ± {p_sd:.2f}",
     f"{s_m:.4f} ± {s_sd:.4f}",
     f"{l_m:.4f} ± {l_sd:.4f}"
@@ -683,6 +712,6 @@ print("REZULTAT EVALUACIJE: ABLACIJA 1 (w/o Spatial Encoder)")
 print("="*80)
 print(tabulate(rezultati, headers=["Konfiguracija", "PSNR [↑]", "SSIM [↑]", "LPIPS [↓]"], tablefmt="fancy_grid"))
 
-csv_out = os.path.join(DRIVE_PROJECT_DIR, "rezultat_ablacija_1_no_spatial_customloss.csv")
+csv_out = os.path.join(DRIVE_PROJECT_DIR, "rezultat_ablacija_1_no_spatial_customloss_30ep_10ep.csv")
 pd.DataFrame(rezultati, columns=["Konfiguracija", "PSNR", "SSIM", "LPIPS"]).to_csv(csv_out, index=False)
 print(f"✓ Rezultat sačuvan u: {csv_out}\n")
