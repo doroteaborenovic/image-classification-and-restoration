@@ -556,12 +556,12 @@ class Restauracija_NoSkipRefine(nn.Module):
         super().__init__()
         self.edge_branch = EdgeBranch(out_channels=base_ch)
         self.edge_fusion = nn.Conv2d(base_ch * 2, base_ch, 1, bias=False)
-        
+
         self.spatial_block1 = SpatialEncoderRestorationBlock(in_channels, base_ch)
         self.spatial_block2 = SpatialEncoderRestorationBlock(base_ch, base_ch * 2)
         self.spatial_block3 = SpatialEncoderRestorationBlock(base_ch * 2, base_ch * 4)
         self.spatial_block4 = SpatialEncoderRestorationBlock(base_ch * 4, base_ch * 8)
-        
+
         self.spectral_init = nn.Sequential(nn.Conv2d(in_channels, base_ch, 3, padding=1, bias=False), nn.GroupNorm(4, base_ch), nn.ReLU(inplace=False))
         self.spectral_block1 = SpectralDecompositionRestorationBlock(base_ch)
         self.spectral_pool1 = nn.MaxPool2d(2)
@@ -573,12 +573,12 @@ class Restauracija_NoSkipRefine(nn.Module):
         self.spectral_pool3 = nn.MaxPool2d(2)
         self.spec_proj3 = nn.Sequential(nn.Conv2d(base_ch * 4, base_ch * 8, 1, bias=False), nn.GroupNorm(4, base_ch * 8), nn.ReLU(inplace=False))
         self.spectral_block4 = SpectralDecompositionRestorationBlock(base_ch * 8)
-        
+
         self.cross1 = AsymmetricCrossBridgeRestoration(base_ch, base_ch, base_ch)
         self.cross2 = AsymmetricCrossBridgeRestoration(base_ch * 2, base_ch * 2, base_ch * 2)
         self.cross3 = AsymmetricCrossBridgeRestoration(base_ch * 4, base_ch * 4, base_ch * 4)
         self.cross4 = AsymmetricCrossBridgeRestoration(base_ch * 8, base_ch * 8, base_ch * 8)
-        
+
         self.gated_fusion = GatedFusionRestorationBlock(base_ch * 8, base_ch * 8, base_ch * 8)
         self.damage_attention = DamageAttentionRestorationModule(base_ch * 8)
         self.bottleneck_refine = nn.Sequential(
@@ -588,7 +588,7 @@ class Restauracija_NoSkipRefine(nn.Module):
             DilatedContextBlock(base_ch * 8),
             RecursiveDenseRestorationBlock(base_ch * 8, num_recursions=2)
         )
-        
+
         self.decoder4 = DecoderRestorationBlock(base_ch * 8, base_ch * 8, base_ch * 4)
         self.decoder3 = DecoderRestorationBlock(base_ch * 4, base_ch * 4, base_ch * 2)
         self.decoder2 = DecoderRestorationBlock(base_ch * 2, base_ch * 2, base_ch)
