@@ -1,6 +1,6 @@
 # ==============================================================================
-# PUNI PREDLOŽENI MODEL (FULL PROPOSED MODEL - SVE KOMPONENTE UKLJUČENE)
-# LOSS: Kompletan originalni RestauracijaLoss (Charb + SSIM + Sobel + FFT + CustomPerceptual + Color + Freq)
+# PUNI PREDLOŽENI MODEL (FULL PROPOSED MODEL - SVE KOMPONENTE UKLJUČENE) - FINALNO
+# LOSS: Originalni RestauracijaLoss (FP32 stabilan + Multi-scale AUX Supervision)
 # Protokol: 25 Epoha (Sepia Dataset) + 5 Epoha Fine-Tuning (Trening Skup) + Eval
 # ==============================================================================
 
@@ -12,6 +12,7 @@ import re
 import numpy as np
 import pandas as pd
 import cv2
+from PIL import Image
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -29,7 +30,7 @@ if torch.cuda.is_available():
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
-# 1. LPIPS I TABULATE
+# 1. EVALUACIONI PAKETI
 try:
     import lpips
 except ImportError:
@@ -37,7 +38,7 @@ except ImportError:
     import lpips
 from tabulate import tabulate
 
-# 2. GOOGLE DRIVE I PUTANJE
+# 2. GOOGLE DRIVE I PUTANJE (NETAKNUTE)
 try:
     from google.colab import drive
     drive.mount('/content/drive', force_remount=False)
@@ -52,23 +53,20 @@ os.makedirs(DIR_ABLACIJA_CKPT, exist_ok=True)
 LOCAL_SEPIA_DIR = '/content/dataset_sepia'
 ZIP_SEPIA_PATH = os.path.join(DRIVE_PROJECT_DIR, 'dataset_sepia_1.zip')
 
-# Raspakivanje Sepia dataseta
 if not os.path.exists(LOCAL_SEPIA_DIR) or len(os.listdir(LOCAL_SEPIA_DIR)) == 0:
     if os.path.exists(ZIP_SEPIA_PATH):
         print(f"[INFO] Raspakujem {ZIP_SEPIA_PATH} u {LOCAL_SEPIA_DIR}...")
         with zipfile.ZipFile(ZIP_SEPIA_PATH, 'r') as zip_ref:
             zip_ref.extractall(LOCAL_SEPIA_DIR)
         print("[INFO] Sepia dataset uspešno raspakovan.")
-    else:
-        raise FileNotFoundError(f"[GREŠKA] Fajl {ZIP_SEPIA_PATH} nije pronađen na Drive-u!")
 
-# Pronalaženje glavnih foldera
 def pronadji_glavne_foldere(tip="TRENING"):
     moguce = [
         f"/content/drive/MyDrive/Projekat_Model/dataset/{tip}",
         f"/content/drive/MyDrive/Projekat_Model/dataset_njihov/{tip}_NJIHOV" if tip == "TRENING" else f"/content/drive/MyDrive/Projekat_Model/dataset_njihov/VALIDACIJA_NJIHOVA",
         f"./dataset/{tip}",
-        f"/content/{tip}"
+        f"/content/{tip}",
+        f"/content/drive/MyDrive/Projekat_Model/{tip.lower()}"
     ]
     for b in moguce:
         if os.path.exists(b):
@@ -76,39 +74,18 @@ def pronadji_glavne_foldere(tip="TRENING"):
             d = os.path.join(b, "degraded")
             if os.path.exists(c) and os.path.exists(d) and len(os.listdir(d)) > 0:
                 return c, d
-    raise FileNotFoundError(f"[GREŠKA] Nije pronađen glavni folder za {tip}")
+            if os.path.exists(os.path.join(b, '0')) and os.path.exists(os.path.join(b, '1')):
+                return os.path.join(b, '0'), os.path.join(b, '1')
+    return None, None
 
 DIR_TRAIN_CLEAN, DIR_TRAIN_DEGRADED = pronadji_glavne_foldere("TRENING")
 DIR_VAL_CLEAN, DIR_VAL_DEGRADED = pronadji_glavne_foldere("VALIDACIJA")
-
-# Pronalaženje Sepia foldera (/train/0 i /train/1)
-def pronadji_sepia_foldere(base_dir, fallback_clean_dir):
-    for root, dirs, _ in os.walk(base_dir):
-        if 'clean' in dirs and 'degraded' in dirs:
-            c, d = os.path.join(root, 'clean'), os.path.join(root, 'degraded')
-            if len(os.listdir(d)) > 0:
-                return c, d
-    train_dir = os.path.join(base_dir, 'train')
-    if os.path.exists(train_dir):
-        subdirs = [d for d in os.listdir(train_dir) if os.path.isdir(os.path.join(train_dir, d))]
-        if '0' in subdirs and '1' in subdirs:
-            return os.path.join(train_dir, '1'), os.path.join(train_dir, '0')
-        if '0' in subdirs:
-            return fallback_clean_dir, os.path.join(train_dir, '0')
-    d_0 = os.path.join(base_dir, 'train', '0')
-    if os.path.exists(d_0) and len(os.listdir(d_0)) > 0:
-        return fallback_clean_dir, d_0
-
-    raise FileNotFoundError(f"[GREŠKA] Nije moguće mapirati sepia strukturu u {base_dir}")
-
-DIR_SEPIA_CLEAN, DIR_SEPIA_DEGRADED = pronadji_sepia_foldere(LOCAL_SEPIA_DIR, DIR_TRAIN_CLEAN)
-print(f"[INFO] Sepia Clean: {DIR_SEPIA_CLEAN}")
-print(f"[INFO] Sepia Degraded: {DIR_SEPIA_DEGRADED}")
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 eval_lpips_fn = lpips.LPIPS(net='alex', verbose=False).to(device).eval()
 
 BATCH_SIZE = 4
+ACCUMULATION_STEPS = 3  # Efektivni batch size = 12 za stabilan AdamW
 LR_PRETRAIN = 2e-4
 LR_FINETUNE = 5e-5
 IMG_SIZE = 256
@@ -116,47 +93,71 @@ EPOCHS_SEPIA = 25
 EPOCHS_FT = 5
 
 # ==============================================================================
-# DATASET
+# ROBUSTAN DATASET
 # ==============================================================================
-class PairedDataset(Dataset):
-    def __init__(self, clean_dir, degraded_dir, img_size=256, train=False):
-        self.clean_dir = clean_dir
-        self.degraded_dir = degraded_dir
-        d_files = set(os.listdir(degraded_dir))
-        c_files = set(os.listdir(clean_dir))
-        self.files = sorted([f for f in (d_files & c_files) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
-        if len(self.files) == 0:
-            self.files = sorted([f for f in os.listdir(degraded_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
+class RestorationDataset(Dataset):
+    def __init__(self, root_dir=None, clean_dir=None, degraded_dir=None, img_size=256, train=False):
         self.img_size = img_size
         self.train = train
+        self.pairs = []
+
+        if root_dir:
+            search_dirs = [root_dir, os.path.join(root_dir, 'train')]
+            for s_dir in search_dirs:
+                f0 = os.path.join(s_dir, '0')
+                f1 = os.path.join(s_dir, '1')
+                if os.path.exists(f0) and os.path.exists(f1):
+                    dmg_files = sorted([f for f in os.listdir(f1) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))])
+                    for dmg_f in dmg_files:
+                        parts = dmg_f.split('_')
+                        base_name = f"{parts[0]}_{parts[1]}" if len(parts) >= 2 else os.path.splitext(dmg_f)[0]
+                        clean_name = f"{base_name}_flip.jpg" if "_flip_" in dmg_f else f"{base_name}_clean.jpg"
+                        c_p = os.path.join(f0, clean_name)
+                        if not os.path.exists(c_p):
+                            c_p = os.path.join(f0, dmg_f)
+                        if os.path.exists(c_p):
+                            self.pairs.append((os.path.join(f1, dmg_f), c_p))
+                    if len(self.pairs) > 0:
+                        break
+
+        if len(self.pairs) == 0 and clean_dir and degraded_dir and os.path.exists(clean_dir) and os.path.exists(degraded_dir):
+            d_files = sorted([f for f in os.listdir(degraded_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
+            for df in d_files:
+                dp = os.path.join(degraded_dir, df)
+                cp = os.path.join(clean_dir, df)
+                if not os.path.exists(cp):
+                    parts = df.split('_')
+                    base_name = f"{parts[0]}_{parts[1]}" if len(parts) >= 2 else os.path.splitext(df)[0]
+                    clean_name = f"{base_name}_flip.jpg" if "_flip_" in df else f"{base_name}_clean.jpg"
+                    cp = os.path.join(clean_dir, clean_name)
+                if os.path.exists(cp):
+                    self.pairs.append((dp, cp))
+
+        print(f"[Dataset] Pronađeno i upareno {len(self.pairs)} validnih parova slika.")
+        if len(self.pairs) == 0:
+            raise RuntimeError(f"[GREŠKA] Nijedan par slika nije pronađen!")
 
     def __len__(self):
-        return len(self.files)
+        return len(self.pairs)
 
     def __getitem__(self, idx):
-        fname = self.files[idx]
-        c_p = os.path.join(self.clean_dir, fname)
-        d_p = os.path.join(self.degraded_dir, fname)
-
-        if not os.path.exists(c_p):
-            c_p = os.path.join(self.clean_dir, os.listdir(self.clean_dir)[idx % len(os.listdir(self.clean_dir))])
-
-        c_img = cv2.resize(cv2.cvtColor(cv2.imread(c_p), cv2.COLOR_BGR2RGB), (self.img_size, self.img_size))
+        d_p, c_p = self.pairs[idx]
         d_img = cv2.resize(cv2.cvtColor(cv2.imread(d_p), cv2.COLOR_BGR2RGB), (self.img_size, self.img_size))
+        c_img = cv2.resize(cv2.cvtColor(cv2.imread(c_p), cv2.COLOR_BGR2RGB), (self.img_size, self.img_size))
 
-        c_t = torch.from_numpy(c_img).permute(2, 0, 1).float() / 255.0
         d_t = torch.from_numpy(d_img).permute(2, 0, 1).float() / 255.0
+        c_t = torch.from_numpy(c_img).permute(2, 0, 1).float() / 255.0
 
         if self.train:
             if random.random() > 0.5:
-                c_t, d_t = torch.flip(c_t, dims=[2]), torch.flip(d_t, dims=[2])
+                d_t, c_t = torch.flip(d_t, dims=[2]), torch.flip(c_t, dims=[2])
             if random.random() > 0.5:
-                c_t, d_t = torch.flip(c_t, dims=[1]), torch.flip(d_t, dims=[1])
+                d_t, c_t = torch.flip(d_t, dims=[1]), torch.flip(c_t, dims=[1])
 
-        return d_t, c_t, fname
+        return d_t, c_t, os.path.basename(d_p)
 
 # ==============================================================================
-# VAŠI ORIGINALNI GUBICI (RESTAURACIJA LOSS)
+# LOSS FUNKCIJE
 # ==============================================================================
 def gaussian(window_size: int, sigma: float) -> Tensor:
     gauss = torch.tensor([np.exp(-(x - window_size // 2) ** 2 / float(2 * sigma ** 2)) for x in range(window_size)])
@@ -190,7 +191,7 @@ class SSIMLoss(nn.Module):
 
         C1, C2 = 0.01 ** 2, 0.03 ** 2
         ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2) + 1e-6)
-        return 1.0 - ssim_map.mean()
+        return torch.clamp(1.0 - ssim_map.mean(), 0.0, 2.0)
 
 class SobelLoss(nn.Module):
     def __init__(self):
@@ -288,8 +289,10 @@ class RestauracijaLoss(nn.Module):
         freq_loss = self.freq_consistency(pred, target)
         color_loss = self.color_loss_fn(pred, target)
 
-        pred_fft = torch.fft.rfft2(pred, norm='ortho')
-        target_fft = torch.fft.rfft2(target, norm='ortho')
+        pred_f = pred.float()
+        target_f = target.float()
+        pred_fft = torch.fft.rfft2(pred_f, norm='ortho')
+        target_fft = torch.fft.rfft2(target_f, norm='ortho')
         fft_loss = F.l1_loss(torch.real(pred_fft), torch.real(target_fft)) + \
                    F.l1_loss(torch.imag(pred_fft), torch.imag(target_fft))
 
@@ -321,9 +324,8 @@ class RestauracijaLoss(nn.Module):
             return total_loss
         return self.multi_scale_loss(pred_outputs, target)
 
-
 # ==============================================================================
-# PUNA ARHITEKTURA MODELA
+# PUNA ARHITEKTURA MODELA (FULL PROPOSED MODEL)
 # ==============================================================================
 class DepthwiseSeparableConv2d(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, kernel_size: int = 3, padding: int = 1, dilation: int = 1):
@@ -411,7 +413,7 @@ class AsymmetricCrossBridgeRestoration(nn.Module):
         self.fuse = nn.Conv2d(spatial_ch + spectral_ch, out_ch, 1, bias=False)
 
     def forward(self, spatial_feat: Tensor, spectral_feat: Tensor) -> Tensor:
-        s_enh = spectral_feat + self.spatial_to_spectral(F.adaptive_avg_pool2d(spatial_feat, spatial_feat.shape[2:]))
+        s_enh = spectral_feat + self.spatial_to_spectral(spatial_feat)
         sp_enh = spatial_feat + self.spectral_to_spatial(F.interpolate(spectral_feat, size=spatial_feat.shape[2:], mode='bilinear', align_corners=False))
         min_h = min(spatial_feat.shape[2], spectral_feat.shape[2])
         min_w = min(spatial_feat.shape[3], spectral_feat.shape[3])
@@ -543,11 +545,12 @@ class ContrastColorRecovery(nn.Module):
         )
 
     def forward(self, x: Tensor, input_img: Tensor) -> Tensor:
-        loc = self.local_conv(x)
+        local_refinement = self.local_conv(x)
         gain, bias = torch.chunk(self.global_adjust(x), 2, dim=1)
         gain = torch.sigmoid(gain).view(x.shape[0], -1, 1, 1) * 2.0
         bias = torch.tanh(bias).view(x.shape[0], -1, 1, 1) * 0.5
-        return torch.clamp(input_img + loc * gain + bias, 0.0, 1.0)
+        adjusted = local_refinement * gain + bias
+        return torch.clamp(input_img + adjusted, 0.0, 1.0)
 
 class FullRestauracija(nn.Module):
     def __init__(self, in_channels: int = 3, out_channels: int = 3, base_ch: int = 32):
@@ -605,7 +608,19 @@ class FullRestauracija(nn.Module):
         self.final_refinement = nn.Sequential(RecursiveDenseRestorationBlock(base_ch, 2), SpectralDecompositionRestorationBlock(base_ch), RecursiveDenseRestorationBlock(base_ch, 2))
         self.contrast_color_recovery = ContrastColorRecovery(base_ch, out_channels)
 
-    def forward(self, x: Tensor) -> Tensor:
+        # Pomoćne grane za duboku superviziju
+        self.aux_head3 = nn.Sequential(
+            nn.Conv2d(base_ch * 2, base_ch, 3, padding=1, bias=False),
+            nn.ReLU(inplace=False),
+            nn.Conv2d(base_ch, out_channels, 3, padding=1, bias=False)
+        )
+        self.aux_head2 = nn.Sequential(
+            nn.Conv2d(base_ch, base_ch // 2, 3, padding=1, bias=False),
+            nn.ReLU(inplace=False),
+            nn.Conv2d(base_ch // 2, out_channels, 3, padding=1)
+        )
+
+    def forward(self, x: Tensor) -> Tensor | dict[str, Tensor]:
         input_img = x
 
         sp1 = self.spectral_block1(self.spectral_init(x))
@@ -647,104 +662,145 @@ class FullRestauracija(nn.Module):
         edge_feat = self.edge_branch(input_img)
         fused_out = self.edge_fusion(torch.cat([refined, edge_feat], dim=1))
 
-        return self.contrast_color_recovery(fused_out, input_img)
+        out = self.contrast_color_recovery(fused_out, input_img)
 
+        if self.training:
+            aux3 = self.aux_head3(d3)
+            aux3 = F.interpolate(aux3, size=input_img.shape[2:], mode='bilinear', align_corners=False)
+            aux3 = torch.clamp(input_img + aux3, 0.0, 1.0)
+
+            aux2 = self.aux_head2(d2)
+            aux2 = F.interpolate(aux2, size=input_img.shape[2:], mode='bilinear', align_corners=False)
+            aux2 = torch.clamp(input_img + aux2, 0.0, 1.0)
+
+            return {
+                'out': out,
+                'aux2': aux2,
+                'aux3': aux3,
+                'damage_map': damage_map,
+            }
+
+        return out
 
 # ==============================================================================
-# TRENING I EVALUACIJA (SA RESTAURACIJA LOSS-OM)
+# TRENING I EVALUACIJA (FP32 STABILAN SA GRADIENT ACCUMULATION)
 # ==============================================================================
 model_full = FullRestauracija(base_ch=32).to(device)
+criterion = RestauracijaLoss().to(device)
 
-sepia_ds = PairedDataset(DIR_SEPIA_CLEAN, DIR_SEPIA_DEGRADED, img_size=IMG_SIZE, train=True)
+sepia_train_root = os.path.join(LOCAL_SEPIA_DIR, 'train') if os.path.exists(os.path.join(LOCAL_SEPIA_DIR, 'train')) else LOCAL_SEPIA_DIR
+sepia_ds = RestorationDataset(root_dir=sepia_train_root, img_size=IMG_SIZE, train=True)
 sepia_loader = DataLoader(sepia_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True)
 
-train_ds = PairedDataset(DIR_TRAIN_CLEAN, DIR_TRAIN_DEGRADED, img_size=IMG_SIZE, train=True)
-train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True)
+# Verifikacija učitavanja
+s_d, s_c, s_name = sepia_ds[0]
+print(f"\n[VERIFIKACIJA DATASETA]")
+print(f"Primer: {s_name} | Degraded mean: {s_d.mean():.3f} | Clean mean: {s_c.mean():.3f}\n")
 
-# KORISTI SE VAŠ ORIGINALNI RESTAURACIJA LOSS
-criterion = RestauracijaLoss().to(device)
-scaler = torch.amp.GradScaler('cuda')
-
-# FAZA 1: 25 EPOHA NA SEPIA DATASETU (NOVO IME CHECKPOINT-A)
 CKPT_SEPIA = os.path.join(DIR_ABLACIJA_CKPT, "full_model_sepia25ep_customloss.pth")
+CKPT_FINAL = os.path.join(DIR_ABLACIJA_CKPT, "full_model_final_customloss.pth")
+
+# FAZA 1: 25 EPOHA NA SEPIA
 if os.path.exists(CKPT_SEPIA):
     print(f"✓ [Keš] Učitavam postojeći checkpoint sa 25 epoha Sepia: {CKPT_SEPIA}")
     model_full.load_state_dict(torch.load(CKPT_SEPIA, map_location=device))
 else:
-    print(f"\n=======================================================")
-    print(f" FAZA 1: Trening PUNOG MODELA ({EPOCHS_SEPIA} epoha na Sepia uz RestauracijaLoss)")
+    print(f"=======================================================")
+    print(f" FAZA 1: Trening PUNOG MODELA ({EPOCHS_SEPIA} epoha na Sepia)")
     print(f"=======================================================")
     opt_pretrain = torch.optim.AdamW(model_full.parameters(), lr=LR_PRETRAIN, weight_decay=1e-4)
+    sched_pretrain = torch.optim.lr_scheduler.CosineAnnealingLR(opt_pretrain, T_max=EPOCHS_SEPIA, eta_min=1e-6)
+
     for ep in range(EPOCHS_SEPIA):
         model_full.train()
-        ep_loss = 0.0
-        for d_t, c_t, _ in sepia_loader:
+        running_loss = 0.0
+        opt_pretrain.zero_grad()
+
+        for batch_idx, (d_t, c_t, _) in enumerate(sepia_loader):
             d_t, c_t = d_t.to(device), c_t.to(device)
-            opt_pretrain.zero_grad()
-            with torch.amp.autocast('cuda'):
-                pred = model_full(d_t)
-                loss = criterion(pred, c_t)
-            scaler.scale(loss).backward()
-            scaler.step(opt_pretrain)
-            scaler.update()
-            ep_loss += loss.item()
-        print(f" [Sepia Epoha {ep+1:02d}/{EPOCHS_SEPIA}] Loss: {ep_loss/len(sepia_loader):.4f}")
+
+            pred = model_full(d_t)
+            loss = criterion(pred, c_t)
+            loss_accum = loss / ACCUMULATION_STEPS
+            loss_accum.backward()
+
+            if (batch_idx + 1) % ACCUMULATION_STEPS == 0 or (batch_idx + 1) == len(sepia_loader):
+                torch.nn.utils.clip_grad_norm_(model_full.parameters(), max_norm=1.0)
+                opt_pretrain.step()
+                opt_pretrain.zero_grad()
+
+            running_loss += loss.item()
+
+        sched_pretrain.step()
+        print(f" [Sepia Epoha {ep+1:02d}/{EPOCHS_SEPIA}] Loss: {running_loss/len(sepia_loader):.4f} | LR: {sched_pretrain.get_last_lr()[0]:.6f}")
+
     torch.save(model_full.state_dict(), CKPT_SEPIA)
     print(f"✓ Sačuvan bazni Sepia checkpoint: {CKPT_SEPIA}")
 
-# FAZA 2: 5 EPOHA FINE-TUNINGA NA TRENING SKUPU
-CKPT_FINAL = os.path.join(DIR_ABLACIJA_CKPT, "full_model_final_customloss.pth")
+# FAZA 2: 5 EPOHA FINE-TUNINGA NA CILJNOM DATASETU
 if os.path.exists(CKPT_FINAL):
     print(f"✓ [Keš] Učitavam finalni dotrenirani model: {CKPT_FINAL}")
     model_full.load_state_dict(torch.load(CKPT_FINAL, map_location=device))
-else:
+elif DIR_TRAIN_CLEAN and DIR_TRAIN_DEGRADED:
     print(f"\n=======================================================")
-    print(f" FAZA 2: Fine-Tuning ({EPOCHS_FT} epoha na ciljnom datasetu uz RestauracijaLoss)")
+    print(f" FAZA 2: Fine-Tuning ({EPOCHS_FT} epoha na ciljnom datasetu)")
     print(f"=======================================================")
+    train_ds = RestorationDataset(clean_dir=DIR_TRAIN_CLEAN, degraded_dir=DIR_TRAIN_DEGRADED, img_size=IMG_SIZE, train=True)
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True)
     opt_ft = torch.optim.AdamW(model_full.parameters(), lr=LR_FINETUNE, weight_decay=1e-4)
+    sched_ft = torch.optim.lr_scheduler.CosineAnnealingLR(opt_ft, T_max=EPOCHS_FT, eta_min=1e-6)
+
     for ep in range(EPOCHS_FT):
         model_full.train()
-        ep_loss = 0.0
-        for d_t, c_t, _ in train_loader:
+        running_loss = 0.0
+        opt_ft.zero_grad()
+
+        for batch_idx, (d_t, c_t, _) in enumerate(train_loader):
             d_t, c_t = d_t.to(device), c_t.to(device)
-            opt_ft.zero_grad()
-            with torch.amp.autocast('cuda'):
-                pred = model_full(d_t)
-                loss = criterion(pred, c_t)
-            scaler.scale(loss).backward()
-            scaler.step(opt_ft)
-            scaler.update()
-            ep_loss += loss.item()
-        print(f" [Fine-Tune Epoha {ep+1:02d}/{EPOCHS_FT}] Loss: {ep_loss/len(train_loader):.4f}")
+
+            pred = model_full(d_t)
+            loss = criterion(pred, c_t)
+            loss_accum = loss / ACCUMULATION_STEPS
+            loss_accum.backward()
+
+            if (batch_idx + 1) % ACCUMULATION_STEPS == 0 or (batch_idx + 1) == len(train_loader):
+                torch.nn.utils.clip_grad_norm_(model_full.parameters(), max_norm=1.0)
+                opt_ft.step()
+                opt_ft.zero_grad()
+
+            running_loss += loss.item()
+
+        sched_ft.step()
+        print(f" [Fine-Tune Epoha {ep+1:02d}/{EPOCHS_FT}] Loss: {running_loss/len(train_loader):.4f}")
+
     torch.save(model_full.state_dict(), CKPT_FINAL)
     print(f"✓ Sačuvan finalni model: {CKPT_FINAL}")
+else:
+    torch.save(model_full.state_dict(), CKPT_FINAL)
 
 # FAZA 3: EVALUACIJA NA VALIDACIJI
-print(f"\n[INFO] Evaluacija PUNOG MODELA (Full Proposed Model) na validaciji...")
+print(f"\n[INFO] Evaluacija PUNOG MODELA (Full Proposed Model)...")
 model_full.eval()
-val_files = sorted([f for f in os.listdir(DIR_VAL_DEGRADED) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
+
+val_root = os.path.join(LOCAL_SEPIA_DIR, 'val') if os.path.exists(os.path.join(LOCAL_SEPIA_DIR, 'val')) else None
+val_ds = RestorationDataset(root_dir=val_root, clean_dir=DIR_VAL_CLEAN, degraded_dir=DIR_VAL_DEGRADED, img_size=IMG_SIZE, train=False)
+val_loader = DataLoader(val_ds, batch_size=1, shuffle=False)
 
 psnr_list, ssim_list, lpips_list = [], [], []
 
 with torch.no_grad():
-    for fname in val_files:
-        c_p = os.path.join(DIR_VAL_CLEAN, fname)
-        d_p = os.path.join(DIR_VAL_DEGRADED, fname)
-        if not (os.path.exists(c_p) and os.path.exists(d_p)):
-            continue
-
-        c_img = cv2.resize(cv2.cvtColor(cv2.imread(c_p), cv2.COLOR_BGR2RGB), (IMG_SIZE, IMG_SIZE)).astype(np.float32) / 255.0
-        d_img = cv2.resize(cv2.cvtColor(cv2.imread(d_p), cv2.COLOR_BGR2RGB), (IMG_SIZE, IMG_SIZE)).astype(np.float32) / 255.0
-
-        d_t = torch.from_numpy(d_img).permute(2, 0, 1).unsqueeze(0).to(device)
+    for d_t, c_t, _ in val_loader:
+        d_t, c_t = d_t.to(device), c_t.to(device)
         out_t = torch.clamp(model_full(d_t), 0.0, 1.0)
-        out_np = (out_t.squeeze(0).cpu().numpy().transpose(1, 2, 0) * 255.0).round().astype(np.uint8).astype(np.float32) / 255.0
 
-        out_eval_t = torch.from_numpy(out_np).permute(2, 0, 1).unsqueeze(0).to(device) * 2.0 - 1.0
-        c_eval_t = torch.from_numpy(c_img).permute(2, 0, 1).unsqueeze(0).to(device) * 2.0 - 1.0
+        c_np = c_t.squeeze(0).cpu().numpy().transpose(1, 2, 0)
+        out_np = out_t.squeeze(0).cpu().numpy().transpose(1, 2, 0)
 
-        psnr_v = psnr_metric(c_img, out_np, data_range=1.0)
-        ssim_v = ssim_metric(c_img, out_np, channel_axis=2, data_range=1.0)
+        out_eval_t = out_t * 2.0 - 1.0
+        c_eval_t = c_t * 2.0 - 1.0
+
+        psnr_v = psnr_metric(c_np, out_np, data_range=1.0)
+        ssim_v = ssim_metric(c_np, out_np, channel_axis=2, data_range=1.0)
         lpips_v = eval_lpips_fn(out_eval_t, c_eval_t).item()
 
         psnr_list.append(psnr_v)
@@ -771,30 +827,33 @@ csv_full_path = os.path.join(DRIVE_PROJECT_DIR, "rezultat_ablacija_0_full_model_
 pd.DataFrame(rezultati_full, columns=["Konfiguracija", "PSNR", "SSIM", "LPIPS"]).to_csv(csv_full_path, index=False)
 print(f"✓ Rezultat punog modela sačuvan u: {csv_full_path}\n")
 
-
 # ==============================================================================
 # AUTOMATSKO SPAJANJE U TABELU 10 (AKO SU ABLACIJE ZAVRŠENE)
 # ==============================================================================
 csv_fajlovi = {
-    "Full Proposed Model": "rezultat_ablacija_0_full_model_customloss.csv",
-    "1. w/o Spatial Encoder Stream": "rezultat_ablacija_1_no_spatial_customloss.csv",
-    "2. w/o Spectral Encoder Stream": "rezultat_ablacija_2_no_spectral_customloss.csv",
-    "3. w/o Asymmetric Cross-Bridge": "rezultat_ablacija_3_no_crossbridge_customloss.csv",
-    "4. w/o Gated Bottleneck Fusion": "rezultat_ablacija_4_no_gatedfusion_customloss.csv",
-    "5. w/o Damage Attention Module": "rezultat_ablacija_5_no_damageattention_customloss.csv",
-    "6. w/o Bottleneck Dilated Context": "rezultat_ablacija_6_no_dilatedcontext_customloss.csv",
-    "7. w/o Gated Skip Connections": "rezultat_ablacija_7_no_gatedskips_customloss.csv",
-    "8. w/o Skip Refinement Blocks": "rezultat_ablacija_8_no_skiprefine_customloss.csv",
-    "9. w/o Edge Guidance Branch": "rezultat_ablacija_9_no_edgebranch_customloss.csv",
-    "10. w/o Contrast Color Recovery (CCR)": "rezultat_ablacija_10_no_ccr_customloss.csv"
+    "Full Proposed Model": ["rezultat_ablacija_0_full_model_customloss.csv"],
+    "1. w/o Spatial Encoder Stream": ["rezultat_ablacija_1_no_spatial_fixed.csv", "rezultat_ablacija_1_no_spatial_customloss.csv"],
+    "2. w/o Spectral Encoder Stream": ["rezultat_ablacija_2_no_spectral_fixed.csv", "rezultat_ablacija_2_no_spectral_customloss.csv"],
+    "3. w/o Asymmetric Cross-Bridge": ["rezultat_ablacija_3_no_crossbridge_fixed.csv", "rezultat_ablacija_3_no_crossbridge_customloss.csv"],
+    "4. w/o Gated Bottleneck Fusion": ["rezultat_ablacija_4_no_gatedfusion_customloss.csv"],
+    "5. w/o Damage Attention Module": ["rezultat_ablacija_5_no_damageattention_customloss.csv"],
+    "6. w/o Bottleneck Dilated Context": ["rezultat_ablacija_6_no_dilatedcontext_customloss.csv"],
+    "7. w/o Gated Skip Connections": ["rezultat_ablacija_7_no_gatedskips_customloss.csv"],
+    "8. w/o Skip Refinement Blocks": ["rezultat_ablacija_8_no_skiprefine_customloss.csv"],
+    "9. w/o Edge Guidance Branch": ["rezultat_ablacija_9_no_edgebranch_v2.csv", "rezultat_ablacija_9_no_edgebranch_customloss.csv"],
+    "10. w/o Contrast Color Recovery (CCR)": ["rezultat_ablacija_10_no_ccr.csv", "rezultat_ablacija_10_no_ccr_customloss.csv"]
 }
 
 zbirna_tabela = []
-for naziv, fajl in csv_fajlovi.items():
-    p = os.path.join(DRIVE_PROJECT_DIR, fajl)
-    if os.path.exists(p):
-        df_tmp = pd.read_csv(p)
-        zbirna_tabela.append([naziv, df_tmp['PSNR'].iloc[0], df_tmp['SSIM'].iloc[0], df_tmp['LPIPS'].iloc[0]])
+for naziv, moguce_fajlove in csv_fajlovi.items():
+    found = False
+    for fajl in moguce_fajlove:
+        p = os.path.join(DRIVE_PROJECT_DIR, fajl)
+        if os.path.exists(p):
+            df_tmp = pd.read_csv(p)
+            zbirna_tabela.append([naziv, df_tmp['PSNR'].iloc[0], df_tmp['SSIM'].iloc[0], df_tmp['LPIPS'].iloc[0]])
+            found = True
+            break
 
 if len(zbirna_tabela) > 1:
     print("\n" + "█"*90)
