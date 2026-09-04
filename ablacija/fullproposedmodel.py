@@ -1,7 +1,7 @@
 # ==============================================================================
 # PUNI PREDLOŽENI MODEL (FULL PROPOSED MODEL - SVE KOMPONENTE UKLJUČENE)
+# LOSS: Kompletan originalni RestauracijaLoss (Charb + SSIM + Sobel + FFT + CustomPerceptual + Color + Freq)
 # Protokol: 25 Epoha (Sepia Dataset) + 5 Epoha Fine-Tuning (Trening Skup) + Eval
-# + Automatsko kreiranje kompletne Tabele 10 i 10b ako postoje prethodni CSV-ovi
 # ==============================================================================
 
 import os
@@ -12,13 +12,11 @@ import re
 import numpy as np
 import pandas as pd
 import cv2
-from scipy import stats
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from torch.utils.data import Dataset, DataLoader
-from torchvision.models import vgg16, VGG16_Weights
 from skimage.metrics import structural_similarity as ssim_metric
 from skimage.metrics import peak_signal_noise_ratio as psnr_metric
 
@@ -48,7 +46,7 @@ except Exception:
 
 DRIVE_PROJECT_DIR = '/content/drive/MyDrive/Projekat_Model'
 os.makedirs(DRIVE_PROJECT_DIR, exist_ok=True)
-DIR_ABLACIJA_CKPT = os.path.join(DRIVE_PROJECT_DIR, 'ablacija_checkpoints_pravi')
+DIR_ABLACIJA_CKPT = os.path.join(DRIVE_PROJECT_DIR, 'ablacija_checkpoints_customloss')
 os.makedirs(DIR_ABLACIJA_CKPT, exist_ok=True)
 
 LOCAL_SEPIA_DIR = '/content/dataset_sepia'
@@ -118,7 +116,7 @@ EPOCHS_SEPIA = 25
 EPOCHS_FT = 5
 
 # ==============================================================================
-# DATASET & LOSS
+# DATASET
 # ==============================================================================
 class PairedDataset(Dataset):
     def __init__(self, clean_dir, degraded_dir, img_size=256, train=False):
@@ -157,29 +155,175 @@ class PairedDataset(Dataset):
 
         return d_t, c_t, fname
 
-class VGGPerceptualLoss(nn.Module):
+# ==============================================================================
+# VAŠI ORIGINALNI GUBICI (RESTAURACIJA LOSS)
+# ==============================================================================
+def gaussian(window_size: int, sigma: float) -> Tensor:
+    gauss = torch.tensor([np.exp(-(x - window_size // 2) ** 2 / float(2 * sigma ** 2)) for x in range(window_size)])
+    return gauss / gauss.sum()
+
+class SSIMLoss(nn.Module):
+    def __init__(self, window_size: int = 11):
+        super().__init__()
+        self.window_size = window_size
+        self.channel = 3
+        _1D_window = gaussian(window_size, 1.5).unsqueeze(1)
+        _2D_window = _1D_window.mm(_1D_window.t()).float().unsqueeze(0).unsqueeze(0)
+        self.register_buffer('window', _2D_window.expand(self.channel, 1, window_size, window_size).contiguous())
+
+    def forward(self, img1: Tensor, img2: Tensor) -> Tensor:
+        _, channel, _, _ = img1.size()
+        if channel == self.channel and self.window.data.type() == img1.data.type():
+            window = self.window
+        else:
+            _1D_window = gaussian(self.window_size, 1.5).unsqueeze(1)
+            _2D_window = _1D_window.mm(_1D_window.t()).float().unsqueeze(0).unsqueeze(0)
+            window = _2D_window.expand(channel, 1, self.window_size, self.window_size).to(img1.device)
+
+        mu1 = F.conv2d(img1, window, padding=self.window_size // 2, groups=channel)
+        mu2 = F.conv2d(img2, window, padding=self.window_size // 2, groups=channel)
+        mu1_sq, mu2_sq, mu1_mu2 = mu1.pow(2), mu2.pow(2), mu1 * mu2
+
+        sigma1_sq = F.conv2d(img1 * img1, window, padding=self.window_size // 2, groups=channel) - mu1_sq
+        sigma2_sq = F.conv2d(img2 * img2, window, padding=self.window_size // 2, groups=channel) - mu2_sq
+        sigma12 = F.conv2d(img1 * img2, window, padding=self.window_size // 2, groups=channel) - mu1_mu2
+
+        C1, C2 = 0.01 ** 2, 0.03 ** 2
+        ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2) + 1e-6)
+        return 1.0 - ssim_map.mean()
+
+class SobelLoss(nn.Module):
     def __init__(self):
         super().__init__()
-        vgg = vgg16(weights=VGG16_Weights.DEFAULT).features
-        self.slice1 = nn.Sequential(*list(vgg.children())[:4])
-        self.slice2 = nn.Sequential(*list(vgg.children())[4:9])
-        self.slice3 = nn.Sequential(*list(vgg.children())[9:16])
-        for param in self.parameters():
-            param.requires_grad = False
+        kx = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]]).unsqueeze(0).unsqueeze(0)
+        ky = torch.tensor([[-1., -2., -1.], [0., 0., 0.], [1., 2., 1.]]).unsqueeze(0).unsqueeze(0)
+        self.register_buffer('kx', kx)
+        self.register_buffer('ky', ky)
 
-    def forward(self, input: Tensor, target: Tensor) -> Tensor:
-        mean = torch.tensor([0.485, 0.456, 0.406], device=input.device).view(1, 3, 1, 1)
-        std = torch.tensor([0.229, 0.224, 0.225], device=input.device).view(1, 3, 1, 1)
-        inp = (input - mean) / std
-        tgt = (target - mean) / std
-        h1_in, h1_tgt = self.slice1(inp), self.slice1(tgt)
-        h2_in, h2_tgt = self.slice2(h1_in), self.slice2(h1_tgt)
-        h3_in, h3_tgt = self.slice3(h2_in), self.slice3(h2_tgt)
-        return F.l1_loss(h1_in, h1_tgt) + F.l1_loss(h2_in, h2_tgt) + F.l1_loss(h3_in, h3_tgt)
+    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
+        p_gray = torch.mean(pred, dim=1, keepdim=True)
+        t_gray = torch.mean(target, dim=1, keepdim=True)
+        gx_p = F.conv2d(p_gray, self.kx, padding=1)
+        gy_p = F.conv2d(p_gray, self.ky, padding=1)
+        gx_t = F.conv2d(t_gray, self.kx, padding=1)
+        gy_t = F.conv2d(t_gray, self.ky, padding=1)
+        return F.l1_loss(gx_p, gx_t) + F.l1_loss(gy_p, gy_t)
+
+class ColorLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
+        pred_blur = F.avg_pool2d(pred, kernel_size=5, stride=1, padding=2)
+        target_blur = F.avg_pool2d(target, kernel_size=5, stride=1, padding=2)
+        return F.l1_loss(pred_blur, target_blur)
+
+class CustomPerceptualLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.scales = [1, 2, 4]
+        dx = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]]).unsqueeze(0).unsqueeze(0)
+        dy = torch.tensor([[-1., -2., -1.], [0., 0., 0.], [1., 2., 1.]]).unsqueeze(0).unsqueeze(0)
+        lap = torch.tensor([[0., 1., 0.], [1., -4., 1.], [0., 1., 0.]]).unsqueeze(0).unsqueeze(0)
+        self.register_buffer('dx', dx.repeat(3, 1, 1, 1))
+        self.register_buffer('dy', dy.repeat(3, 1, 1, 1))
+        self.register_buffer('lap', lap.repeat(3, 1, 1, 1))
+
+    def extract_features(self, x: Tensor) -> list[Tensor]:
+        feats = []
+        for s in self.scales:
+            x_scaled = F.interpolate(x, scale_factor=1.0 / s, mode='bilinear', align_corners=False) if s > 1 else x
+            fx = F.conv2d(x_scaled, self.dx, padding=1, groups=3)
+            fy = F.conv2d(x_scaled, self.dy, padding=1, groups=3)
+            flap = F.conv2d(x_scaled, self.lap, padding=1, groups=3)
+            feats.extend([fx, fy, flap])
+        return feats
+
+    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
+        pred_feats = self.extract_features(pred)
+        target_feats = self.extract_features(target)
+        loss = 0.0
+        for pf, tf in zip(pred_feats, target_feats):
+            loss += F.l1_loss(pf, tf)
+        return loss / len(pred_feats)
+
+class SoftHardExampleMiningLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
+        error_map = torch.abs(pred - target).mean(dim=1, keepdim=True).detach()
+        return 1.0 + torch.sigmoid((error_map - error_map.mean()) / (error_map.std() + 1e-6))
+
+class FrequencyConsistencyLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
+        pred_low = F.avg_pool2d(pred, kernel_size=5, stride=1, padding=2)
+        tgt_low = F.avg_pool2d(target, kernel_size=5, stride=1, padding=2)
+        pred_high = pred - pred_low
+        tgt_high = target - tgt_low
+        return 0.4 * F.l1_loss(pred_low, tgt_low) + 0.6 * F.l1_loss(pred_high, tgt_high)
+
+class RestauracijaLoss(nn.Module):
+    def __init__(self, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.sobel = SobelLoss()
+        self.ssim = SSIMLoss()
+        self.perceptual = CustomPerceptualLoss()
+        self.soft_hem = SoftHardExampleMiningLoss()
+        self.freq_consistency = FrequencyConsistencyLoss()
+        self.color_loss_fn = ColorLoss()
+
+    def single_scale_loss(self, pred: Tensor, target: Tensor) -> Tensor:
+        hem_weight = self.soft_hem(pred, target)
+        char_diff = torch.sqrt((pred - target) ** 2 + self.eps)
+        char_loss = torch.mean(char_diff * hem_weight)
+
+        ssim_loss = self.ssim(pred, target)
+        edge_loss = self.sobel(pred, target)
+        percep_loss = self.perceptual(pred, target)
+        freq_loss = self.freq_consistency(pred, target)
+        color_loss = self.color_loss_fn(pred, target)
+
+        pred_fft = torch.fft.rfft2(pred, norm='ortho')
+        target_fft = torch.fft.rfft2(target, norm='ortho')
+        fft_loss = F.l1_loss(torch.real(pred_fft), torch.real(target_fft)) + \
+                   F.l1_loss(torch.imag(pred_fft), torch.imag(target_fft))
+
+        return (
+            0.40 * char_loss +
+            0.10 * ssim_loss +
+            0.10 * edge_loss +
+            0.15 * fft_loss +
+            0.10 * percep_loss +
+            0.10 * color_loss +
+            0.05 * freq_loss
+        )
+
+    def multi_scale_loss(self, pred: Tensor, target: Tensor) -> Tensor:
+        loss = self.single_scale_loss(pred, target)
+        for scale in [0.5, 0.25]:
+            p = F.interpolate(pred, scale_factor=scale, mode='bilinear', align_corners=False)
+            t = F.interpolate(target, scale_factor=scale, mode='bilinear', align_corners=False)
+            loss += scale * torch.mean(torch.sqrt((p - t) ** 2 + self.eps))
+        return loss
+
+    def forward(self, pred_outputs: Tensor | dict[str, Tensor], target: Tensor) -> Tensor:
+        if isinstance(pred_outputs, dict):
+            total_loss = self.multi_scale_loss(pred_outputs['out'], target)
+            if 'aux3' in pred_outputs:
+                total_loss += 0.3 * torch.mean(torch.sqrt((pred_outputs['aux3'] - target) ** 2 + self.eps))
+            if 'aux2' in pred_outputs:
+                total_loss += 0.15 * torch.mean(torch.sqrt((pred_outputs['aux2'] - target) ** 2 + self.eps))
+            return total_loss
+        return self.multi_scale_loss(pred_outputs, target)
 
 
 # ==============================================================================
-# PUNA ARHITEKTURA MODELA (KOMPLETAN PREDLOŽENI SISTEM)
+# PUNA ARHITEKTURA MODELA
 # ==============================================================================
 class DepthwiseSeparableConv2d(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, kernel_size: int = 3, padding: int = 1, dilation: int = 1):
@@ -405,20 +549,17 @@ class ContrastColorRecovery(nn.Module):
         bias = torch.tanh(bias).view(x.shape[0], -1, 1, 1) * 0.5
         return torch.clamp(input_img + loc * gain + bias, 0.0, 1.0)
 
-# KOMPLETAN MODEL RESTAURACIJE
 class FullRestauracija(nn.Module):
     def __init__(self, in_channels: int = 3, out_channels: int = 3, base_ch: int = 32):
         super().__init__()
         self.edge_branch = EdgeBranch(out_channels=base_ch)
         self.edge_fusion = nn.Conv2d(base_ch * 2, base_ch, 1, bias=False)
         
-        # Spatial Encoder
         self.spatial_block1 = SpatialEncoderRestorationBlock(in_channels, base_ch)
         self.spatial_block2 = SpatialEncoderRestorationBlock(base_ch, base_ch * 2)
         self.spatial_block3 = SpatialEncoderRestorationBlock(base_ch * 2, base_ch * 4)
         self.spatial_block4 = SpatialEncoderRestorationBlock(base_ch * 4, base_ch * 8)
         
-        # Spectral Encoder
         self.spectral_init = nn.Sequential(nn.Conv2d(in_channels, base_ch, 3, padding=1, bias=False), nn.GroupNorm(4, base_ch), nn.ReLU(inplace=False))
         self.spectral_block1 = SpectralDecompositionRestorationBlock(base_ch)
         self.spectral_pool1 = nn.MaxPool2d(2)
@@ -431,13 +572,11 @@ class FullRestauracija(nn.Module):
         self.spec_proj3 = nn.Sequential(nn.Conv2d(base_ch * 4, base_ch * 8, 1, bias=False), nn.GroupNorm(4, base_ch * 8), nn.ReLU(inplace=False))
         self.spectral_block4 = SpectralDecompositionRestorationBlock(base_ch * 8)
         
-        # Asymmetric Cross-Bridge
         self.cross1 = AsymmetricCrossBridgeRestoration(base_ch, base_ch, base_ch)
         self.cross2 = AsymmetricCrossBridgeRestoration(base_ch * 2, base_ch * 2, base_ch * 2)
         self.cross3 = AsymmetricCrossBridgeRestoration(base_ch * 4, base_ch * 4, base_ch * 4)
         self.cross4 = AsymmetricCrossBridgeRestoration(base_ch * 8, base_ch * 8, base_ch * 8)
         
-        # Bottleneck
         self.gated_fusion = GatedFusionRestorationBlock(base_ch * 8, base_ch * 8, base_ch * 8)
         self.damage_attention = DamageAttentionRestorationModule(base_ch * 8)
         self.bottleneck_refine = nn.Sequential(
@@ -448,13 +587,11 @@ class FullRestauracija(nn.Module):
             RecursiveDenseRestorationBlock(base_ch * 8, num_recursions=2)
         )
         
-        # Decoder
         self.decoder4 = DecoderRestorationBlock(base_ch * 8, base_ch * 8, base_ch * 4)
         self.decoder3 = DecoderRestorationBlock(base_ch * 4, base_ch * 4, base_ch * 2)
         self.decoder2 = DecoderRestorationBlock(base_ch * 2, base_ch * 2, base_ch)
         self.decoder1 = DecoderRestorationBlock(base_ch, base_ch, base_ch)
 
-        # Skips
         self.skip_gate1 = GatedSkipConnection(base_ch)
         self.skip_gate2 = GatedSkipConnection(base_ch * 2)
         self.skip_gate3 = GatedSkipConnection(base_ch * 4)
@@ -465,35 +602,29 @@ class FullRestauracija(nn.Module):
         self.skip_refine3 = nn.Sequential(RecursiveDenseRestorationBlock(base_ch * 4, 2), SpectralDecompositionRestorationBlock(base_ch * 4))
         self.skip_refine4 = nn.Sequential(RecursiveDenseRestorationBlock(base_ch * 8, 2), SpectralDecompositionRestorationBlock(base_ch * 8))
 
-        # Final Refine & CCR
         self.final_refinement = nn.Sequential(RecursiveDenseRestorationBlock(base_ch, 2), SpectralDecompositionRestorationBlock(base_ch), RecursiveDenseRestorationBlock(base_ch, 2))
         self.contrast_color_recovery = ContrastColorRecovery(base_ch, out_channels)
 
     def forward(self, x: Tensor) -> Tensor:
         input_img = x
 
-        # Spectral grana
         sp1 = self.spectral_block1(self.spectral_init(x))
         sp2 = self.spectral_block2(self.spec_proj1(self.spectral_pool1(sp1)))
         sp3 = self.spectral_block3(self.spec_proj2(self.spectral_pool2(sp2)))
         sp4 = self.spectral_block4(self.spec_proj3(self.spectral_pool3(sp3)))
 
-        # Spatial grana
         s1, s1_skip = self.spatial_block1(x)
         s2, s2_skip = self.spatial_block2(s1)
         s3, s3_skip = self.spatial_block3(s2)
         s4, s4_skip = self.spatial_block4(s3)
 
-        # Cross-Bridge
         c1, c2, c3, c4 = self.cross1(s1_skip, sp1), self.cross2(s2_skip, sp2), self.cross3(s3_skip, sp3), self.cross4(s4_skip, sp4)
         s4_enriched = s4 + F.adaptive_avg_pool2d(c4, s4.shape[2:])
 
-        # Bottleneck Fuzija & Damage Attention
         fused = self.gated_fusion(s4_enriched, sp4)
         attended, damage_map = self.damage_attention(fused)
         bottleneck_out = self.bottleneck_refine(attended)
 
-        # Skips
         c4_r = F.interpolate(c4, size=s4_skip.shape[2:], mode='bilinear', align_corners=False)
         c3_r = F.interpolate(c3, size=s3_skip.shape[2:], mode='bilinear', align_corners=False)
         c2_r = F.interpolate(c2, size=s2_skip.shape[2:], mode='bilinear', align_corners=False)
@@ -504,7 +635,6 @@ class FullRestauracija(nn.Module):
         sk2 = self.skip_refine2(self.skip_gate2(s2_skip) + c2_r)
         sk1 = self.skip_refine1(self.skip_gate1(s1_skip) + c1_r)
 
-        # Dekodovanje
         d4 = self.decoder4(bottleneck_out, sk4, damage_map)
         d3 = self.decoder3(d4, sk3, damage_map)
         d2 = self.decoder2(d3, sk2, damage_map)
@@ -513,7 +643,6 @@ class FullRestauracija(nn.Module):
         if d1.shape[2:] != input_img.shape[2:]:
             d1 = F.interpolate(d1, size=input_img.shape[2:], mode='bilinear', align_corners=False)
 
-        # Finalna rafinacija & Edge grana & CCR
         refined = self.final_refinement(d1)
         edge_feat = self.edge_branch(input_img)
         fused_out = self.edge_fusion(torch.cat([refined, edge_feat], dim=1))
@@ -522,7 +651,7 @@ class FullRestauracija(nn.Module):
 
 
 # ==============================================================================
-# TRENING I EVALUACIJA ZA PUNI MODEL
+# TRENING I EVALUACIJA (SA RESTAURACIJA LOSS-OM)
 # ==============================================================================
 model_full = FullRestauracija(base_ch=32).to(device)
 
@@ -532,18 +661,18 @@ sepia_loader = DataLoader(sepia_ds, batch_size=BATCH_SIZE, shuffle=True, num_wor
 train_ds = PairedDataset(DIR_TRAIN_CLEAN, DIR_TRAIN_DEGRADED, img_size=IMG_SIZE, train=True)
 train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True)
 
-crit_l1 = nn.L1Loss()
-crit_vgg = VGGPerceptualLoss().to(device)
+# KORISTI SE VAŠ ORIGINALNI RESTAURACIJA LOSS
+criterion = RestauracijaLoss().to(device)
 scaler = torch.amp.GradScaler('cuda')
 
-# FAZA 1: 25 EPOHA NA SEPIA DATASETU
-CKPT_SEPIA = os.path.join(DIR_ABLACIJA_CKPT, "full_model_sepia25ep.pth")
+# FAZA 1: 25 EPOHA NA SEPIA DATASETU (NOVO IME CHECKPOINT-A)
+CKPT_SEPIA = os.path.join(DIR_ABLACIJA_CKPT, "full_model_sepia25ep_customloss.pth")
 if os.path.exists(CKPT_SEPIA):
     print(f"✓ [Keš] Učitavam postojeći checkpoint sa 25 epoha Sepia: {CKPT_SEPIA}")
     model_full.load_state_dict(torch.load(CKPT_SEPIA, map_location=device))
 else:
     print(f"\n=======================================================")
-    print(f" FAZA 1: Trening PUNOG MODELA ({EPOCHS_SEPIA} epoha na Sepia)")
+    print(f" FAZA 1: Trening PUNOG MODELA ({EPOCHS_SEPIA} epoha na Sepia uz RestauracijaLoss)")
     print(f"=======================================================")
     opt_pretrain = torch.optim.AdamW(model_full.parameters(), lr=LR_PRETRAIN, weight_decay=1e-4)
     for ep in range(EPOCHS_SEPIA):
@@ -554,7 +683,7 @@ else:
             opt_pretrain.zero_grad()
             with torch.amp.autocast('cuda'):
                 pred = model_full(d_t)
-                loss = crit_l1(pred, c_t) + 0.1 * crit_vgg(pred, c_t)
+                loss = criterion(pred, c_t)
             scaler.scale(loss).backward()
             scaler.step(opt_pretrain)
             scaler.update()
@@ -564,13 +693,13 @@ else:
     print(f"✓ Sačuvan bazni Sepia checkpoint: {CKPT_SEPIA}")
 
 # FAZA 2: 5 EPOHA FINE-TUNINGA NA TRENING SKUPU
-CKPT_FINAL = os.path.join(DIR_ABLACIJA_CKPT, "full_model_final.pth")
+CKPT_FINAL = os.path.join(DIR_ABLACIJA_CKPT, "full_model_final_customloss.pth")
 if os.path.exists(CKPT_FINAL):
     print(f"✓ [Keš] Učitavam finalni dotrenirani model: {CKPT_FINAL}")
     model_full.load_state_dict(torch.load(CKPT_FINAL, map_location=device))
 else:
     print(f"\n=======================================================")
-    print(f" FAZA 2: Fine-Tuning ({EPOCHS_FT} epoha na ciljnom datasetu)")
+    print(f" FAZA 2: Fine-Tuning ({EPOCHS_FT} epoha na ciljnom datasetu uz RestauracijaLoss)")
     print(f"=======================================================")
     opt_ft = torch.optim.AdamW(model_full.parameters(), lr=LR_FINETUNE, weight_decay=1e-4)
     for ep in range(EPOCHS_FT):
@@ -581,7 +710,7 @@ else:
             opt_ft.zero_grad()
             with torch.amp.autocast('cuda'):
                 pred = model_full(d_t)
-                loss = crit_l1(pred, c_t) + 0.1 * crit_vgg(pred, c_t)
+                loss = criterion(pred, c_t)
             scaler.scale(loss).backward()
             scaler.step(opt_ft)
             scaler.update()
@@ -638,26 +767,26 @@ print("REZULTAT EVALUACIJE: PUNI PREDLOŽENI MODEL (Full Proposed Model)")
 print("="*90)
 print(tabulate(rezultati_full, headers=["Konfiguracija", "PSNR [↑]", "SSIM [↑]", "LPIPS [↓]"], tablefmt="fancy_grid"))
 
-csv_full_path = os.path.join(DRIVE_PROJECT_DIR, "rezultat_ablacija_0_full_model.csv")
+csv_full_path = os.path.join(DRIVE_PROJECT_DIR, "rezultat_ablacija_0_full_model_customloss.csv")
 pd.DataFrame(rezultati_full, columns=["Konfiguracija", "PSNR", "SSIM", "LPIPS"]).to_csv(csv_full_path, index=False)
 print(f"✓ Rezultat punog modela sačuvan u: {csv_full_path}\n")
 
 
 # ==============================================================================
-# AUTOMATSKO SPAJANJE U TABELU 10 (AKO SU SVE ABLACIJE ZAVRŠENE)
+# AUTOMATSKO SPAJANJE U TABELU 10 (AKO SU ABLACIJE ZAVRŠENE)
 # ==============================================================================
 csv_fajlovi = {
-    "Full Proposed Model": "rezultat_ablacija_0_full_model.csv",
-    "1. w/o Spatial Encoder Stream": "rezultat_ablacija_1_no_spatial.csv",
-    "2. w/o Spectral Encoder Stream": "rezultat_ablacija_2_no_spectral.csv",
-    "3. w/o Asymmetric Cross-Bridge": "rezultat_ablacija_3_no_crossbridge.csv",
-    "4. w/o Gated Bottleneck Fusion": "rezultat_ablacija_4_no_gatedfusion.csv",
-    "5. w/o Damage Attention Module": "rezultat_ablacija_5_no_damageattention.csv",
-    "6. w/o Bottleneck Dilated Context": "rezultat_ablacija_6_no_dilatedcontext.csv",
-    "7. w/o Gated Skip Connections": "rezultat_ablacija_7_no_gatedskips.csv",
-    "8. w/o Skip Refinement Blocks": "rezultat_ablacija_8_no_skiprefine.csv",
-    "9. w/o Edge Guidance Branch": "rezultat_ablacija_9_no_edgebranch.csv",
-    "10. w/o Contrast Color Recovery (CCR)": "rezultat_ablacija_10_no_ccr.csv"
+    "Full Proposed Model": "rezultat_ablacija_0_full_model_customloss.csv",
+    "1. w/o Spatial Encoder Stream": "rezultat_ablacija_1_no_spatial_customloss.csv",
+    "2. w/o Spectral Encoder Stream": "rezultat_ablacija_2_no_spectral_customloss.csv",
+    "3. w/o Asymmetric Cross-Bridge": "rezultat_ablacija_3_no_crossbridge_customloss.csv",
+    "4. w/o Gated Bottleneck Fusion": "rezultat_ablacija_4_no_gatedfusion_customloss.csv",
+    "5. w/o Damage Attention Module": "rezultat_ablacija_5_no_damageattention_customloss.csv",
+    "6. w/o Bottleneck Dilated Context": "rezultat_ablacija_6_no_dilatedcontext_customloss.csv",
+    "7. w/o Gated Skip Connections": "rezultat_ablacija_7_no_gatedskips_customloss.csv",
+    "8. w/o Skip Refinement Blocks": "rezultat_ablacija_8_no_skiprefine_customloss.csv",
+    "9. w/o Edge Guidance Branch": "rezultat_ablacija_9_no_edgebranch_customloss.csv",
+    "10. w/o Contrast Color Recovery (CCR)": "rezultat_ablacija_10_no_ccr_customloss.csv"
 }
 
 zbirna_tabela = []
@@ -673,6 +802,6 @@ if len(zbirna_tabela) > 1:
     print("█"*90)
     print(tabulate(zbirna_tabela, headers=["Konfiguracija", "PSNR [↑]", "SSIM [↑]", "LPIPS [↓]"], tablefmt="fancy_grid"))
     
-    csv_tabela10 = os.path.join(DRIVE_PROJECT_DIR, "tabela10_prava_ablacija_zbirno.csv")
+    csv_tabela10 = os.path.join(DRIVE_PROJECT_DIR, "tabela10_prava_ablacija_zbirno_customloss.csv")
     pd.DataFrame(zbirna_tabela, columns=["Konfiguracija", "PSNR", "SSIM", "LPIPS"]).to_csv(csv_tabela10, index=False)
     print(f"\n✓ Zbirni CSV sačuvan na: {csv_tabela10}\n")
