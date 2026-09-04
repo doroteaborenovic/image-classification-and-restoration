@@ -599,8 +599,12 @@ class Restauracija_NoSkipRefine(nn.Module):
         self.skip_gate3 = GatedSkipConnection(base_ch * 4)
         self.skip_gate4 = GatedSkipConnection(base_ch * 8)
 
-        # NEMA Skip Refine blokova
-        self.final_refinement = nn.Sequential(RecursiveDenseRestorationBlock(base_ch, 2), SpectralDecompositionRestorationBlock(base_ch), RecursiveDenseRestorationBlock(base_ch, 2))
+        # NEMA Skip Refine blokova (direktno prosleđivanje gejtovanih preskoka)
+        self.final_refinement = nn.Sequential(
+            RecursiveDenseRestorationBlock(base_ch, 2),
+            SpectralDecompositionRestorationBlock(base_ch),
+            RecursiveDenseRestorationBlock(base_ch, 2)
+        )
         self.contrast_color_recovery = ContrastColorRecovery(base_ch, out_channels)
 
         # Pomoćne grane za duboku superviziju
@@ -640,7 +644,7 @@ class Restauracija_NoSkipRefine(nn.Module):
         c2_r = F.interpolate(c2, size=s2_skip.shape[2:], mode='bilinear', align_corners=False)
         c1_r = F.interpolate(c1, size=s1_skip.shape[2:], mode='bilinear', align_corners=False)
 
-        # BEZ SKIP REFINE: Direktno prosleđivanje gejtovanih preskoka
+        # BEZ SKIP REFINE: Gejtovani preskoci se direktno sabiraju
         sk4 = self.skip_gate4(s4_skip) + c4_r
         sk3 = self.skip_gate3(s3_skip) + c3_r
         sk2 = self.skip_gate2(s2_skip) + c2_r
