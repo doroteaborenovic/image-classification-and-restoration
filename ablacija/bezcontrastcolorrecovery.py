@@ -1,8 +1,8 @@
 # ==============================================================================
 # ABLACIJA 10: BEZ CONTRAST COLOR RECOVERY (w/o CCR) - FINALNO STABILIZOVANO
 # LOSS: Originalni RestauracijaLoss (FP32 stabilan + Multi-scale AUX Supervision)
-# Protokol: 25 Epoha (Sepia Dataset) + 5 Epoha Fine-Tuning (Trening Skup) + Eva
-# ============================================================================
+# Protokol: 25 Epoha (Sepia Dataset) + 5 Epoha Fine-Tuning (Trening Skup) + Eval
+# ==============================================================================
 
 import os
 import sys
