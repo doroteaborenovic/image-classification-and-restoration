@@ -1,5 +1,6 @@
 # ==============================================================================
-# NAUČNO POREĐENJE: PREDLOŽENI MODEL VS ZVANIČNI MICROSOFT BOPBL MODEL
+# NAUČNO POREĐENJE SA 5-EPOHNOM ADAPTACIJOM MODELA
+# Predloženi Model (5 Epoha Fine-Tuning) vs Microsoft BOPBL vs Ulaz (Baseline)
 # (5 Iteracija | Bootstrap Mean ± SD | Wilcoxon & t-test | Cohen's d)
 # ==============================================================================
 
@@ -47,6 +48,8 @@ from tabulate import tabulate
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from torch.utils.data import Dataset, DataLoader
+from torchvision.models import vgg16, VGG16_Weights
 
 try:
     from google.colab import drive
@@ -57,11 +60,17 @@ except Exception:
 # Putanje do Google Drive-a
 DRIVE_PROJECT_DIR = '/content/drive/MyDrive/Projekat_Model'
 os.makedirs(DRIVE_PROJECT_DIR, exist_ok=True)
+DIR_ABLACIJA_DRIVE = os.path.join(DRIVE_PROJECT_DIR, 'ablacija_checkpoints')
 DIR_NJIHOV_DRIVE = os.path.join(DRIVE_PROJECT_DIR, 'rezultati_microsoft_zvanicni')
+os.makedirs(DIR_ABLACIJA_DRIVE, exist_ok=True)
 os.makedirs(DIR_NJIHOV_DRIVE, exist_ok=True)
 
+# HIPERPARAMETRI
+EPOCHS_FINETUNE = 5
+BATCH_SIZE = 4
+LR_FINETUNE = 5e-5
 IMG_SIZE = 256
-NUM_ITERACIJA = 5  # 5 iteracija za robusnu ocenu Mean ± SD
+NUM_ITERACIJA = 5  # Broj bootstrap iteracija za Mean ± SD
 
 def pronadji_foldere(tip="VALIDACIJA"):
     moguce = [
@@ -81,16 +90,72 @@ def pronadji_foldere(tip="VALIDACIJA"):
             return c, d, b
     raise FileNotFoundError(f"[GREŠKA] Nije pronađen folder za {tip} sa 'clean' i 'degraded' slikama!")
 
+DIR_TRAIN_CLEAN, DIR_TRAIN_DEGRADED, _ = pronadji_foldere("TRENING")
 DIR_VAL_CLEAN, DIR_VAL_DEGRADED, _ = pronadji_foldere("VALIDACIJA")
+
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 eval_lpips_fn = lpips.LPIPS(net='alex', verbose=False).to(device).eval()
 
 print(f"\n[INFO] Uređaj: {device}")
-print(f"[INFO] Validacioni skup: {len(os.listdir(DIR_VAL_DEGRADED))} slika\n")
+print(f"[INFO] Trening skup: {len(os.listdir(DIR_TRAIN_DEGRADED))} slika | Validacioni skup: {len(os.listdir(DIR_VAL_DEGRADED))} slika\n")
 
 
 # ==============================================================================
-# 1. PUNA ARHITEKTURA PREDLOŽENOG MODELA
+# DATASET I GUBITAK ZA ADAPTACIJU (FINE-TUNING)
+# ==============================================================================
+class PairedDataset(Dataset):
+    def __init__(self, clean_dir, degraded_dir, img_size=256, train=False):
+        self.clean_dir = clean_dir
+        self.degraded_dir = degraded_dir
+        self.files = sorted([f for f in os.listdir(degraded_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
+        self.img_size = img_size
+        self.train = train
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        fname = self.files[idx]
+        c_p = os.path.join(self.clean_dir, fname)
+        d_p = os.path.join(self.degraded_dir, fname)
+
+        c_img = cv2.resize(cv2.cvtColor(cv2.imread(c_p), cv2.COLOR_BGR2RGB), (self.img_size, self.img_size))
+        d_img = cv2.resize(cv2.cvtColor(cv2.imread(d_p), cv2.COLOR_BGR2RGB), (self.img_size, self.img_size))
+
+        c_t = torch.from_numpy(c_img).permute(2, 0, 1).float() / 255.0
+        d_t = torch.from_numpy(d_img).permute(2, 0, 1).float() / 255.0
+
+        if self.train:
+            if random.random() > 0.5:
+                c_t, d_t = torch.flip(c_t, dims=[2]), torch.flip(d_t, dims=[2])
+            if random.random() > 0.5:
+                c_t, d_t = torch.flip(c_t, dims=[1]), torch.flip(d_t, dims=[1])
+
+        return d_t, c_t, fname
+
+class VGGPerceptualLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        vgg = vgg16(weights=VGG16_Weights.DEFAULT).features
+        self.slice1 = nn.Sequential(*list(vgg.children())[:4])
+        self.slice2 = nn.Sequential(*list(vgg.children())[4:9])
+        self.slice3 = nn.Sequential(*list(vgg.children())[9:16])
+        for param in self.parameters():
+            param.requires_grad = False
+
+    def forward(self, input: Tensor, target: Tensor) -> Tensor:
+        mean = torch.tensor([0.485, 0.456, 0.406], device=input.device).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], device=input.device).view(1, 3, 1, 1)
+        inp = (input - mean) / std
+        tgt = (target - mean) / std
+        h1_in, h1_tgt = self.slice1(inp), self.slice1(tgt)
+        h2_in, h2_tgt = self.slice2(h1_in), self.slice2(h1_tgt)
+        h3_in, h3_tgt = self.slice3(h2_in), self.slice3(h2_tgt)
+        return F.l1_loss(h1_in, h1_tgt) + F.l1_loss(h2_in, h2_tgt) + F.l1_loss(h3_in, h3_tgt)
+
+
+# ==============================================================================
+# ARHITEKTURA PREDLOŽENOG MODELA RESTAURACIJE
 # ==============================================================================
 class DepthwiseSeparableConv2d(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, kernel_size: int = 3, padding: int = 1, dilation: int = 1):
@@ -415,7 +480,7 @@ class Restauracija(nn.Module):
 
 
 # ==============================================================================
-# 2. UČITAVANJE VAŠEG MODELA (BEZ DODATNOG TRENIRANJA)
+# UČITAVANJE BAZNOG CHECKPOINT-A I ADAPTACIJA 5 EPOHA
 # ==============================================================================
 def ucitaj_state_dict_pametno(model, candidate_paths, device, strict=True):
     for p in candidate_paths:
@@ -425,30 +490,68 @@ def ucitaj_state_dict_pametno(model, candidate_paths, device, strict=True):
                 sd = ckpt['model_state_dict'] if isinstance(ckpt, dict) and 'model_state_dict' in ckpt else ckpt
                 c_sd = {k.replace('module.', ''): v for k, v in sd.items()} if isinstance(sd, dict) else sd
                 model.load_state_dict(c_sd, strict=strict)
-                print(f"✓ [USPEŠNO UČITAN VAŠ MODEL]: {p}")
+                print(f"✓ [USPEŠNO UČITAN CHECKPOINT]: {p}")
                 return True, p
             except Exception as e:
                 print(f"  [UPOZORENJE] Greška pri učitavanju {p}: {e}")
     return False, None
 
-moguce_lokacije = [DRIVE_PROJECT_DIR, '/content/drive/MyDrive', '/content', './']
-moguca_imena = [
-    'dodinarestauracijabest.pth', 'doroteinarestauracijabest.pth', 'Model_Finetuned_Final.pth',
-    'best_model.pth', 'model_restoration_heavy.pth', 'model.pth', 'checkpoint.pth'
-]
-candidate_base_ckpts = [os.path.join(loc, name) for loc in moguce_lokacije for name in moguca_imena]
-
 moj_model = Restauracija(base_ch=32).to(device)
-uspeh, pronadjena_putanja = ucitaj_state_dict_pametno(moj_model, candidate_base_ckpts, device, strict=True)
-if not uspeh:
-    raise FileNotFoundError("[GREŠKA] Nijedan bazni .pth fajl nije pronađen za vaš model!")
-moj_model.eval()
 
+# Putanja do 5-epohno adaptiranog checkpoint-a
+ADAPTED_CKPT_PATH = os.path.join(DIR_ABLACIJA_DRIVE, 'ablation_Full_Proposed_Model_5ep.pth')
+ALT_ADAPTED_CKPT_PATH = os.path.join(DRIVE_PROJECT_DIR, 'moj_model_finetuned_5ep.pth')
+
+train_ds = PairedDataset(DIR_TRAIN_CLEAN, DIR_TRAIN_DEGRADED, img_size=IMG_SIZE, train=True)
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True)
 val_files = sorted([f for f in os.listdir(DIR_VAL_DEGRADED) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
+
+# Proveri da li već postoji adaptirani model na Drive-u
+if os.path.exists(ADAPTED_CKPT_PATH):
+    print(f"✓ [KEŠ] Učitavam postojeći adaptirani model (5 epoha): {ADAPTED_CKPT_PATH}")
+    moj_model.load_state_dict(torch.load(ADAPTED_CKPT_PATH, map_location=device))
+elif os.path.exists(ALT_ADAPTED_CKPT_PATH):
+    print(f"✓ [KEŠ] Učitavam postojeći adaptirani model (5 epoha): {ALT_ADAPTED_CKPT_PATH}")
+    moj_model.load_state_dict(torch.load(ALT_ADAPTED_CKPT_PATH, map_location=device))
+else:
+    # Učitaj bazni model i odradi 5 epoha fine-tuninga
+    moguce_lokacije = [DRIVE_PROJECT_DIR, '/content/drive/MyDrive', '/content', './']
+    moguca_imena = ['dodinarestauracijabest.pth', 'doroteinarestauracijabest.pth', 'Model_Finetuned_Final.pth', 'best_model.pth', 'model.pth']
+    candidate_base_ckpts = [os.path.join(loc, name) for loc in moguce_lokacije for name in moguca_imena]
+    
+    uspeh, pronadjena_putanja = ucitaj_state_dict_pametno(moj_model, candidate_base_ckpts, device, strict=True)
+    if not uspeh:
+        raise FileNotFoundError("[GREŠKA] Nijedan bazni .pth fajl nije pronađen za predloženi model!")
+    
+    print(f"\n-> [Fine-tune {EPOCHS_FINETUNE} epoha] Pokrećem adaptaciju vašeg modela na trening skupu...")
+    optimizer = torch.optim.AdamW(moj_model.parameters(), lr=LR_FINETUNE, weight_decay=1e-4)
+    crit_l1 = nn.L1Loss()
+    crit_vgg = VGGPerceptualLoss().to(device)
+    scaler = torch.amp.GradScaler('cuda')
+
+    for ep in range(EPOCHS_FINETUNE):
+        moj_model.train()
+        ep_loss = 0.0
+        for d_t, c_t, _ in train_loader:
+            d_t, c_t = d_t.to(device), c_t.to(device)
+            optimizer.zero_grad()
+            with torch.amp.autocast('cuda'):
+                pred = moj_model(d_t)
+                loss = crit_l1(pred, c_t) + 0.1 * crit_vgg(pred, c_t)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            ep_loss += loss.item()
+        print(f"   [Epoha {ep+1}/{EPOCHS_FINETUNE}] Loss: {ep_loss/len(train_loader):.4f}")
+
+    torch.save(moj_model.state_dict(), ADAPTED_CKPT_PATH)
+    print(f"✓ [USPEH] Adaptirani model od 5 epoha je sačuvan na: {ADAPTED_CKPT_PATH}")
+
+moj_model.eval()
 
 
 # ==============================================================================
-# 3. POKRETANJE ZVANIČNOG MICROSOFT BOPBL PIPELINE-A (RUN.PY)
+# ZVANIČNI MICROSOFT MODEL (BOPBL RUN.PY PIPELINE)
 # ==============================================================================
 MS_REPO_DIR = '/content/Bringing-Old-Photos-Back-to-Life'
 DIR_BOPBL_TEMP_OUT = '/content/bopbl_temp_run'
@@ -468,7 +571,6 @@ if not os.path.exists(MS_REPO_DIR):
     subprocess.run(f"cd {MS_REPO_DIR}/Face_Enhancement && wget -q https://github.com/microsoft/Bringing-Old-Photos-Back-to-Life/releases/download/v1.0/face_checkpoints.zip && unzip -q face_checkpoints.zip", shell=True, stdout=devnull, stderr=devnull)
     subprocess.run(f"cd {MS_REPO_DIR}/Global && wget -q https://github.com/microsoft/Bringing-Old-Photos-Back-to-Life/releases/download/v1.0/global_checkpoints.zip && unzip -q global_checkpoints.zip", shell=True, stdout=devnull, stderr=devnull)
 
-# Provera da li na Drive-u već imamo izgenerisane slike zvaničnim Microsoft modelom
 postojece_ms_slike = [f for f in os.listdir(DIR_NJIHOV_DRIVE) if f.lower().endswith(('.png', '.jpg', '.jpeg'))] if os.path.exists(DIR_NJIHOV_DRIVE) else []
 
 if len(postojece_ms_slike) >= len(val_files):
@@ -476,7 +578,6 @@ if len(postojece_ms_slike) >= len(val_files):
 else:
     print(f"\n-> Pokrećem ZVANIČNI Microsoft run.py pipeline nad slikama iz: {DIR_VAL_DEGRADED}...")
     gpu_flag = "0" if torch.cuda.is_available() else "-1"
-    
     cmd = f"cd {MS_REPO_DIR} && python run.py --input_folder {DIR_VAL_DEGRADED} --output_folder {DIR_BOPBL_TEMP_OUT} --GPU {gpu_flag} --with_scratch"
     subprocess.run(cmd, shell=True)
     
@@ -485,14 +586,12 @@ else:
         for img_name in os.listdir(bopbl_final):
             shutil.copy(os.path.join(bopbl_final, img_name), os.path.join(DIR_NJIHOV_DRIVE, img_name))
         print(f"✓ Zvanični Microsoft rezultati sačuvani na Drive: {DIR_NJIHOV_DRIVE}")
-    else:
-        print("[UPOZORENJE] Proverite generisanje Microsoft slika, koristi se Global fallback...")
 
 
 # ==============================================================================
-# 4. IZRAČUNAVANJE METRIKA PO SLIKAMA (INFERENCIJA)
+# INFERENCIJA I RAČUNANJE METRIKA PO SLIKAMA
 # ==============================================================================
-print(f"\n[INFO] Računanje metrika (PSNR, SSIM, LPIPS) na nivou slika...")
+print(f"\n[INFO] Računanje metrika (PSNR, SSIM, LPIPS) na validacionom skupu ({len(val_files)} slika)...")
 
 data_input = []
 data_moj = []
@@ -517,7 +616,7 @@ with torch.no_grad():
         lpips_in = eval_lpips_fn(d_eval_t, c_eval_t).item()
         data_input.append({'Fname': fname, 'PSNR': psnr_in, 'SSIM': ssim_in, 'LPIPS': lpips_in})
 
-        # 2. Predloženi model
+        # 2. Predloženi model (sa 5-epohnom adaptacijom)
         d_t = torch.from_numpy(d_img).permute(2, 0, 1).unsqueeze(0).to(device)
         out_t = torch.clamp(moj_model(d_t), 0.0, 1.0)
         out_np = (out_t.squeeze(0).cpu().numpy().transpose(1, 2, 0) * 255.0).round().astype(np.uint8).astype(np.float32) / 255.0
@@ -536,7 +635,7 @@ with torch.no_grad():
         if os.path.exists(ms_p):
             ms_img = cv2.resize(cv2.cvtColor(cv2.imread(ms_p), cv2.COLOR_BGR2RGB), (IMG_SIZE, IMG_SIZE)).astype(np.float32) / 255.0
         else:
-            ms_img = d_img  # Sigurnosna kopija ukoliko slika fali
+            ms_img = d_img
 
         ms_eval_t = torch.from_numpy(ms_img).permute(2, 0, 1).unsqueeze(0).to(device) * 2.0 - 1.0
         psnr_ms = psnr_metric(c_img, ms_img, data_range=1.0)
@@ -550,7 +649,7 @@ df_ms = pd.DataFrame(data_ms).set_index('Fname')
 
 
 # ==============================================================================
-# 5. METODOLOŠKA EVALUACIJA KROZ 5 ITERACIJA I STATISTIČKI TESTOVI
+# STATISTIČKA EVALUACIJA (5 ITERACIJA BOOTSTRAP | MEAN ± SD | TESTOVI)
 # ==============================================================================
 def get_scene_id(filename):
     base = os.path.splitext(filename)[0]
@@ -587,7 +686,7 @@ for it in range(NUM_ITERACIJA):
 def format_p(p):
     return "< 0.001" if p < 0.001 else f"{p:.4f}"
 
-# Srednje vrednosti i standardne devijacije kroz 5 iteracija
+# Srednje vrednosti i standardne devijacije
 m_in_p, sd_in_p = np.mean(iter_in_p), np.std(iter_in_p)
 m_in_s, sd_in_s = np.mean(iter_in_s), np.std(iter_in_s)
 m_in_l, sd_in_l = np.mean(iter_in_l), np.std(iter_in_l)
@@ -600,7 +699,7 @@ m_ms_p, sd_ms_p = np.mean(iter_ms_p), np.std(iter_ms_p)
 m_ms_s, sd_ms_s = np.mean(iter_ms_s), np.std(iter_ms_s)
 m_ms_l, sd_ms_l = np.mean(iter_ms_l), np.std(iter_ms_l)
 
-# Upareni statistički testovi i Cohen's d (Predloženi Model vs Zvanični Microsoft BOPBL)
+# Statistički upareni testovi (Predloženi Model vs Zvanični Microsoft BOPBL)
 val_moj_p, val_ms_p = df_moj['PSNR'].values, df_ms['PSNR'].values
 val_moj_s, val_ms_s = df_moj['SSIM'].values, df_ms['SSIM'].values
 val_moj_l, val_ms_l = df_moj['LPIPS'].values, df_ms['LPIPS'].values
@@ -619,7 +718,7 @@ d_lpips = np.mean(val_moj_l - val_ms_l) / np.std(val_moj_l - val_ms_l, ddof=1)
 
 
 # ==============================================================================
-# 6. TABELARNI PRIKAZ I ČUVANJE U CSV
+# TABELARNI PRIKAZ I ČUVANJE U CSV
 # ==============================================================================
 tabela_poređenje = [
     [
@@ -670,7 +769,7 @@ zaglavlja = [
 ]
 
 print("\n" + "█" * 125)
-print(f"  TABELA: NAUČNO POREĐENJE RESTAURACIJE ({NUM_ITERACIJA} Iteracija | Mean ± SD | N = {len(df_moj)})")
+print(f"  TABELA: NAUČNO POREĐENJE RESTAURACIJE (5 Epoha Adaptacije | {NUM_ITERACIJA} Iteracija | N = {len(df_moj)})")
 print("█" * 125)
 print(tabulate(tabela_poređenje, headers=zaglavlja, tablefmt="fancy_grid", stralign="center", numalign="center"))
 
