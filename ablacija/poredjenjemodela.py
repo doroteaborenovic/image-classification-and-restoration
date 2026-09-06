@@ -1,7 +1,7 @@
 # ==============================================================================
 # NAUČNO POREĐENJE SA 5-EPOHNOM ADAPTACIJOM MODELA
 # Predloženi Model (5 Epoha Fine-Tuning) vs Microsoft BOPBL vs Ulaz (Baseline)
-# (5 Iteracija | Bootstrap Mean ± SD | Wilcoxon & t-test | Cohen's d)
+# (1000 Bootstrap Iteracija | Mean ± SD | Wilcoxon & t-test | Cohen's d)
 # ==============================================================================
 
 import os
@@ -37,7 +37,7 @@ def normalna_instalacija(paket):
     try:
         __import__(paket)
     except ImportError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", paket], 
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", paket],
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 normalna_instalacija("lpips")
@@ -70,7 +70,7 @@ EPOCHS_FINETUNE = 5
 BATCH_SIZE = 4
 LR_FINETUNE = 5e-5
 IMG_SIZE = 256
-NUM_ITERACIJA = 5  # Broj bootstrap iteracija za Mean ± SD
+NUM_ITERACIJA = 1000  # 1000 klasterisanih bootstrap iteracija po scenama za stabilnu procenu
 
 def pronadji_foldere(tip="VALIDACIJA"):
     moguce = [
@@ -386,12 +386,12 @@ class Restauracija(nn.Module):
         super().__init__()
         self.edge_branch = EdgeBranch(out_channels=base_ch)
         self.edge_fusion = nn.Conv2d(base_ch * 2, base_ch, 1, bias=False)
-        
+
         self.spatial_block1 = SpatialEncoderRestorationBlock(in_channels, base_ch)
         self.spatial_block2 = SpatialEncoderRestorationBlock(base_ch, base_ch * 2)
         self.spatial_block3 = SpatialEncoderRestorationBlock(base_ch * 2, base_ch * 4)
         self.spatial_block4 = SpatialEncoderRestorationBlock(base_ch * 4, base_ch * 8)
-        
+
         self.spectral_init = nn.Sequential(nn.Conv2d(in_channels, base_ch, 3, padding=1, bias=False), nn.GroupNorm(4, base_ch), nn.ReLU(inplace=False))
         self.spectral_block1 = SpectralDecompositionRestorationBlock(base_ch)
         self.spectral_pool1 = nn.MaxPool2d(2)
@@ -403,12 +403,12 @@ class Restauracija(nn.Module):
         self.spectral_pool3 = nn.MaxPool2d(2)
         self.spec_proj3 = nn.Sequential(nn.Conv2d(base_ch * 4, base_ch * 8, 1, bias=False), nn.GroupNorm(4, base_ch * 8), nn.ReLU(inplace=False))
         self.spectral_block4 = SpectralDecompositionRestorationBlock(base_ch * 8)
-        
+
         self.cross1 = AsymmetricCrossBridgeRestoration(base_ch, base_ch, base_ch)
         self.cross2 = AsymmetricCrossBridgeRestoration(base_ch * 2, base_ch * 2, base_ch * 2)
         self.cross3 = AsymmetricCrossBridgeRestoration(base_ch * 4, base_ch * 4, base_ch * 4)
         self.cross4 = AsymmetricCrossBridgeRestoration(base_ch * 8, base_ch * 8, base_ch * 8)
-        
+
         self.gated_fusion = GatedFusionRestorationBlock(base_ch * 8, base_ch * 8, base_ch * 8)
         self.damage_attention = DamageAttentionRestorationModule(base_ch * 8)
         self.bottleneck_refine = nn.Sequential(
@@ -418,7 +418,7 @@ class Restauracija(nn.Module):
             DilatedContextBlock(base_ch * 8),
             RecursiveDenseRestorationBlock(base_ch * 8, num_recursions=2)
         )
-        
+
         self.decoder4 = DecoderRestorationBlock(base_ch * 8, base_ch * 8, base_ch * 4)
         self.decoder3 = DecoderRestorationBlock(base_ch * 4, base_ch * 4, base_ch * 2)
         self.decoder2 = DecoderRestorationBlock(base_ch * 2, base_ch * 2, base_ch)
@@ -498,7 +498,6 @@ def ucitaj_state_dict_pametno(model, candidate_paths, device, strict=True):
 
 moj_model = Restauracija(base_ch=32).to(device)
 
-# Putanja do 5-epohno adaptiranog checkpoint-a
 ADAPTED_CKPT_PATH = os.path.join(DIR_ABLACIJA_DRIVE, 'ablation_Full_Proposed_Model_5ep.pth')
 ALT_ADAPTED_CKPT_PATH = os.path.join(DRIVE_PROJECT_DIR, 'moj_model_finetuned_5ep.pth')
 
@@ -506,7 +505,6 @@ train_ds = PairedDataset(DIR_TRAIN_CLEAN, DIR_TRAIN_DEGRADED, img_size=IMG_SIZE,
 train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True)
 val_files = sorted([f for f in os.listdir(DIR_VAL_DEGRADED) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
 
-# Proveri da li već postoji adaptirani model na Drive-u
 if os.path.exists(ADAPTED_CKPT_PATH):
     print(f"✓ [KEŠ] Učitavam postojeći adaptirani model (5 epoha): {ADAPTED_CKPT_PATH}")
     moj_model.load_state_dict(torch.load(ADAPTED_CKPT_PATH, map_location=device))
@@ -514,15 +512,14 @@ elif os.path.exists(ALT_ADAPTED_CKPT_PATH):
     print(f"✓ [KEŠ] Učitavam postojeći adaptirani model (5 epoha): {ALT_ADAPTED_CKPT_PATH}")
     moj_model.load_state_dict(torch.load(ALT_ADAPTED_CKPT_PATH, map_location=device))
 else:
-    # Učitaj bazni model i odradi 5 epoha fine-tuninga
     moguce_lokacije = [DRIVE_PROJECT_DIR, '/content/drive/MyDrive', '/content', './']
     moguca_imena = ['dodinarestauracijabest.pth', 'doroteinarestauracijabest.pth', 'Model_Finetuned_Final.pth', 'best_model.pth', 'model.pth']
     candidate_base_ckpts = [os.path.join(loc, name) for loc in moguce_lokacije for name in moguca_imena]
-    
+
     uspeh, pronadjena_putanja = ucitaj_state_dict_pametno(moj_model, candidate_base_ckpts, device, strict=True)
     if not uspeh:
         raise FileNotFoundError("[GREŠKA] Nijedan bazni .pth fajl nije pronađen za predloženi model!")
-    
+
     print(f"\n-> [Fine-tune {EPOCHS_FINETUNE} epoha] Pokrećem adaptaciju vašeg modela na trening skupu...")
     optimizer = torch.optim.AdamW(moj_model.parameters(), lr=LR_FINETUNE, weight_decay=1e-4)
     crit_l1 = nn.L1Loss()
@@ -551,7 +548,7 @@ moj_model.eval()
 
 
 # ==============================================================================
-# ZVANIČNI MICROSOFT MODEL (BOPBL RUN.PY PIPELINE)
+# ZVANIČNI MICROSOFT MODEL (BOPBL STANDARDNI RUN.PY PIPELINE BEZ --with_scratch)
 # ==============================================================================
 MS_REPO_DIR = '/content/Bringing-Old-Photos-Back-to-Life'
 DIR_BOPBL_TEMP_OUT = '/content/bopbl_temp_run'
@@ -560,12 +557,12 @@ if not os.path.exists(MS_REPO_DIR):
     devnull = subprocess.DEVNULL
     print("\n-> Preuzimam zvanični Microsoft Bringing-Old-Photos-Back-to-Life repo...")
     subprocess.run(f"git clone -q https://github.com/microsoft/Bringing-Old-Photos-Back-to-Life.git {MS_REPO_DIR}", shell=True, stdout=devnull, stderr=devnull)
-    
+
     p1 = os.path.join(MS_REPO_DIR, 'Face_Enhancement/models/networks')
     p2 = os.path.join(MS_REPO_DIR, 'Global/detection_models')
     subprocess.run(f"cd {p1} && git clone -q https://github.com/vacancy/Synchronized-BatchNorm-PyTorch && cp -rf Synchronized-BatchNorm-PyTorch/sync_batchnorm .", shell=True, stdout=devnull, stderr=devnull)
     subprocess.run(f"cd {p2} && git clone -q https://github.com/vacancy/Synchronized-BatchNorm-PyTorch && cp -rf Synchronized-BatchNorm-PyTorch/sync_batchnorm .", shell=True, stdout=devnull, stderr=devnull)
-    
+
     print("-> Preuzimam zvanične težine: Face & Global Checkpoints + Landmark model...")
     subprocess.run(f"cd {MS_REPO_DIR}/Face_Detection && wget -q http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2 && bzip2 -d shape_predictor_68_face_landmarks.dat.bz2", shell=True, stdout=devnull, stderr=devnull)
     subprocess.run(f"cd {MS_REPO_DIR}/Face_Enhancement && wget -q https://github.com/microsoft/Bringing-Old-Photos-Back-to-Life/releases/download/v1.0/face_checkpoints.zip && unzip -q face_checkpoints.zip", shell=True, stdout=devnull, stderr=devnull)
@@ -573,14 +570,17 @@ if not os.path.exists(MS_REPO_DIR):
 
 postojece_ms_slike = [f for f in os.listdir(DIR_NJIHOV_DRIVE) if f.lower().endswith(('.png', '.jpg', '.jpeg'))] if os.path.exists(DIR_NJIHOV_DRIVE) else []
 
+# Ako nema generisanih slika, pokreni zvanični BOPBL pipeline BEZ --with_scratch
 if len(postojece_ms_slike) >= len(val_files):
     print(f"✓ [KEŠ] Koriste se postojeće generisane slike zvaničnog Microsoft modela sa Google Drive-a ({len(postojece_ms_slike)} slika).")
 else:
-    print(f"\n-> Pokrećem ZVANIČNI Microsoft run.py pipeline nad slikama iz: {DIR_VAL_DEGRADED}...")
+    print(f"\n-> Pokrećem ZVANIČNI Microsoft run.py pipeline (standard restoration bez --with_scratch) nad: {DIR_VAL_DEGRADED}...")
     gpu_flag = "0" if torch.cuda.is_available() else "-1"
-    cmd = f"cd {MS_REPO_DIR} && python run.py --input_folder {DIR_VAL_DEGRADED} --output_folder {DIR_BOPBL_TEMP_OUT} --GPU {gpu_flag} --with_scratch"
-    subprocess.run(cmd, shell=True)
     
+    # IZMENA: Uklonjen fleg --with_scratch radi usklađivanja sa Reviewer 2 nalazom N5
+    cmd = f"cd {MS_REPO_DIR} && python run.py --input_folder {DIR_VAL_DEGRADED} --output_folder {DIR_BOPBL_TEMP_OUT} --GPU {gpu_flag}"
+    subprocess.run(cmd, shell=True)
+
     bopbl_final = os.path.join(DIR_BOPBL_TEMP_OUT, 'final_output')
     if os.path.exists(bopbl_final):
         for img_name in os.listdir(bopbl_final):
@@ -647,9 +647,18 @@ df_in = pd.DataFrame(data_input).set_index('Fname')
 df_moj = pd.DataFrame(data_moj).set_index('Fname')
 df_ms = pd.DataFrame(data_ms).set_index('Fname')
 
+# Čuvanje punih pojedinačnih rezultata po slikama na Drive (za potpunu proverljivost i reprodukciju)
+df_per_image_all = pd.DataFrame({
+    'Input_PSNR': df_in['PSNR'], 'Input_SSIM': df_in['SSIM'], 'Input_LPIPS': df_in['LPIPS'],
+    'Proposed_PSNR': df_moj['PSNR'], 'Proposed_SSIM': df_moj['SSIM'], 'Proposed_LPIPS': df_moj['LPIPS'],
+    'BOPBL_PSNR': df_ms['PSNR'], 'BOPBL_SSIM': df_ms['SSIM'], 'BOPBL_LPIPS': df_ms['LPIPS'],
+})
+df_per_image_all.to_csv(os.path.join(DRIVE_PROJECT_DIR, "per_image_bopbl_poredjenje.csv"))
+print(f"✓ Sačuvane pojedinačne per-image metrike na Drive: {os.path.join(DRIVE_PROJECT_DIR, 'per_image_bopbl_poredjenje.csv')}")
+
 
 # ==============================================================================
-# STATISTIČKA EVALUACIJA (5 ITERACIJA BOOTSTRAP | MEAN ± SD | TESTOVI)
+# STATISTIČKA EVALUACIJA (1000 ITERACIJA BOOTSTRAP | MEAN ± SD | TESTOVI)
 # ==============================================================================
 def get_scene_id(filename):
     base = os.path.splitext(filename)[0]
@@ -666,6 +675,7 @@ iter_in_p, iter_in_s, iter_in_l = [], [], []
 iter_moj_p, iter_moj_s, iter_moj_l = [], [], []
 iter_ms_p, iter_ms_s, iter_ms_l = [], [], []
 
+print(f"\n[INFO] Pokrećem {NUM_ITERACIJA} klasterisanih bootstrap iteracija po scenama...")
 for it in range(NUM_ITERACIJA):
     rng = np.random.default_rng(seed=SEED + it)
     sampled_scenes = rng.choice(unique_scenes, size=len(unique_scenes), replace=True)
@@ -683,10 +693,12 @@ for it in range(NUM_ITERACIJA):
     iter_ms_s.append(df_ms.loc[boot_files]['SSIM'].mean())
     iter_ms_l.append(df_ms.loc[boot_files]['LPIPS'].mean())
 
-def format_p(p):
-    return "< 0.001" if p < 0.001 else f"{p:.4f}"
+def format_p_exact(p):
+    if p < 1e-4:
+        return f"{p:.2e}"
+    return f"{p:.4f}"
 
-# Srednje vrednosti i standardne devijacije
+# Srednje vrednosti i standardne devijacije iz 1000 bootstrap iteracija
 m_in_p, sd_in_p = np.mean(iter_in_p), np.std(iter_in_p)
 m_in_s, sd_in_s = np.mean(iter_in_s), np.std(iter_in_s)
 m_in_l, sd_in_l = np.mean(iter_in_l), np.std(iter_in_l)
@@ -728,8 +740,8 @@ tabela_poređenje = [
         f"{m_ms_p:.2f} ± {sd_ms_p:.2f}",
         f"{m_moj_p - m_in_p:+.2f} dB",
         f"{m_moj_p - m_ms_p:+.2f} dB",
-        format_p(p_w_p),
-        format_p(p_t_p),
+        format_p_exact(p_w_p),
+        format_p_exact(p_t_p),
         f"{d_psnr:.2f}"
     ],
     [
@@ -739,8 +751,8 @@ tabela_poređenje = [
         f"{m_ms_s:.4f} ± {sd_ms_s:.4f}",
         f"{m_moj_s - m_in_s:+.4f}",
         f"{m_moj_s - m_ms_s:+.4f}",
-        format_p(p_w_s),
-        format_p(p_t_s),
+        format_p_exact(p_w_s),
+        format_p_exact(p_t_s),
         f"{d_ssim:.2f}"
     ],
     [
@@ -750,8 +762,8 @@ tabela_poređenje = [
         f"{m_ms_l:.4f} ± {sd_ms_l:.4f}",
         f"{m_moj_l - m_in_l:+.4f}",
         f"{m_moj_l - m_ms_l:+.4f}",
-        format_p(p_w_l),
-        format_p(p_t_l),
+        format_p_exact(p_w_l),
+        format_p_exact(p_t_l),
         f"{d_lpips:.2f}"
     ]
 ]
@@ -769,7 +781,7 @@ zaglavlja = [
 ]
 
 print("\n" + "█" * 125)
-print(f"  TABELA: NAUČNO POREĐENJE RESTAURACIJE (5 Epoha Adaptacije | {NUM_ITERACIJA} Iteracija | N = {len(df_moj)})")
+print(f"  TABELA: NAUČNO POREĐENJE RESTAURACIJE (5 Epoha Adaptacije | {NUM_ITERACIJA} Bootstrap Iteracija | N = {len(df_moj)})")
 print("█" * 125)
 print(tabulate(tabela_poređenje, headers=zaglavlja, tablefmt="fancy_grid", stralign="center", numalign="center"))
 
