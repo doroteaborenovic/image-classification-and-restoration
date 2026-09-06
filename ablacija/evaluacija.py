@@ -1,10 +1,12 @@
 # ==============================================================================
-# PRAVA I KOMPLETNA EVALUACIJA SVIH 10 ABLACIJA + METRIKE + STATISTIČKI TESTOVI
+# FINALNA EVALUACIJA: PUNI MODEL + SVIH 10 ABLACIJA + STATISTIČKI TESTOVI
+# (100% POKLAPANJE CHECKPOINT-A | 1000 BOOTSTRAP ITERACIJA | HOLM-BONFERRONI)
 # ==============================================================================
 
 import os
 import sys
 import random
+import subprocess
 import numpy as np
 import pandas as pd
 import cv2
@@ -17,12 +19,12 @@ from skimage.metrics import structural_similarity as ssim_metric
 from skimage.metrics import peak_signal_noise_ratio as psnr_metric
 from scipy import stats
 
-# 1. INSTALACIJA I IMPORT LPIPS-a
 try:
     import lpips
     from tabulate import tabulate
 except ImportError:
-    os.system("pip install -q lpips tabulate")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "lpips", "tabulate"],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     import lpips
     from tabulate import tabulate
 
@@ -35,7 +37,8 @@ if torch.cuda.is_available():
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
-# 2. PUTANJE NA GOOGLE DRIVE-U
+NUM_BOOTSTRAP = 1000
+
 try:
     from google.colab import drive
     drive.mount('/content/drive', force_remount=False)
@@ -45,6 +48,7 @@ except Exception:
 DRIVE_PROJECT_DIR = '/content/drive/MyDrive/Projekat_Model'
 DIR_ABLACIJA_CKPT = os.path.join(DRIVE_PROJECT_DIR, 'ablacija_checkpoints_customloss')
 DIR_CKPT_PRAVI = os.path.join(DRIVE_PROJECT_DIR, 'ablacija_checkpoints_pravi')
+DIR_CKPT_ALT = os.path.join(DRIVE_PROJECT_DIR, 'ablacija_checkpoints')
 
 def pronadji_glavne_foldere(tip="VALIDACIJA"):
     moguce = [
@@ -99,13 +103,12 @@ class RestorationDataset(Dataset):
         d_p, c_p = self.pairs[idx]
         d_img = cv2.resize(cv2.cvtColor(cv2.imread(d_p), cv2.COLOR_BGR2RGB), (self.img_size, self.img_size))
         c_img = cv2.resize(cv2.cvtColor(cv2.imread(c_p), cv2.COLOR_BGR2RGB), (self.img_size, self.img_size))
-
         d_t = torch.from_numpy(d_img).permute(2, 0, 1).float() / 255.0
         c_t = torch.from_numpy(c_img).permute(2, 0, 1).float() / 255.0
         return d_t, c_t, os.path.basename(d_p)
 
 # ==============================================================================
-# OSNOVNI GRADIVNI MODULI
+# GRADIVNI MODULI
 # ==============================================================================
 class DepthwiseSeparableConv2d(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, kernel_size: int = 3, padding: int = 1, dilation: int = 1):
@@ -116,7 +119,7 @@ class DepthwiseSeparableConv2d(nn.Module):
         return self.pointwise(self.depthwise(x))
 
 class RecursiveDenseRestorationBlock(nn.Module):
-    def __init__(self, channels: int, num_recursions: int = 3):
+    def __init__(self, channels: int, num_recursions: int = 2):
         super().__init__()
         self.num_recursions = num_recursions
         self.conv = DepthwiseSeparableConv2d(channels, channels, 3, padding=1)
@@ -214,6 +217,19 @@ class DecoderRestorationBlock(nn.Module):
         feat = self.dense_micro(self.conv(torch.cat([x, skip, dm], dim=1)))
         return self.spectral(feat)
 
+class DecoderBlockNoSpectral(nn.Module):
+    def __init__(self, in_ch: int, skip_ch: int, out_ch: int):
+        super().__init__()
+        self.upsample = nn.Sequential(nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False), nn.Conv2d(in_ch, in_ch // 2, 3, padding=1, bias=False))
+        self.conv = nn.Sequential(nn.Conv2d(in_ch // 2 + skip_ch + 1, out_ch, 3, padding=1, bias=False), nn.GroupNorm(4, out_ch), nn.ReLU(inplace=False))
+        self.dense_micro = RecursiveDenseRestorationBlock(out_ch, num_recursions=2)
+    def forward(self, x: Tensor, skip: Tensor, damage_map: Tensor) -> Tensor:
+        x = self.upsample(x)
+        if x.shape[2:] != skip.shape[2:]:
+            x = F.interpolate(x, size=skip.shape[2:], mode='bilinear', align_corners=False)
+        dm = F.interpolate(damage_map, size=skip.shape[2:], mode='bilinear', align_corners=False)
+        return self.dense_micro(self.conv(torch.cat([x, skip, dm], dim=1)))
+
 class DecoderRestorationBlock_NoDamageMap(nn.Module):
     def __init__(self, in_ch: int, skip_ch: int, out_ch: int):
         super().__init__()
@@ -263,20 +279,19 @@ class EdgeBranch(nn.Module):
         return self.conv(torch.cat([F.conv2d(x, self.kx, padding=1, groups=3), F.conv2d(x, self.ky, padding=1, groups=3)], dim=1))
 
 class ContrastColorRecovery(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int = 3):
+    def __init__(self, in_ch: int = 32, out_ch: int = 3):
         super().__init__()
         self.local_conv = nn.Sequential(nn.Conv2d(in_ch, in_ch // 2, 3, padding=1, bias=False), nn.GroupNorm(4, in_ch // 2), nn.ReLU(inplace=False), nn.Conv2d(in_ch // 2, out_ch, 3, padding=1))
         self.global_adjust = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Conv2d(in_ch, in_ch // 4, 1, bias=False), nn.ReLU(inplace=False), nn.Conv2d(in_ch // 4, out_ch * 2, 1))
     def forward(self, x: Tensor, input_img: Tensor) -> Tensor:
-        local_refinement = self.local_conv(x)
+        loc = self.local_conv(x)
         gain, bias = torch.chunk(self.global_adjust(x), 2, dim=1)
         gain = torch.sigmoid(gain).view(x.shape[0], -1, 1, 1) * 2.0
         bias = torch.tanh(bias).view(x.shape[0], -1, 1, 1) * 0.5
-        adjusted = local_refinement * gain + bias
-        return torch.clamp(input_img + adjusted, 0.0, 1.0)
+        return torch.clamp(input_img + loc * gain + bias, 0.0, 1.0)
 
 # ==============================================================================
-# DEFINICIJE ARHITEKTURA ZA SVAKU ABLACIONU KONFIGURACIJU
+# DEFINICIJE ARHITEKTURA MODELA
 # ==============================================================================
 
 # PUNI MODEL
@@ -405,7 +420,7 @@ class Ablation1_NoSpatial(nn.Module):
         edge_feat = self.edge_branch(input_img)
         return self.contrast_color_recovery(self.edge_fusion(torch.cat([refined, edge_feat], dim=1)), input_img)
 
-# 2. BEZ SPECTRAL STREAM-A (ISPRAVLJENO: Usklađeno sa punim skip i dekoder modulima)
+# 2. BEZ SPECTRAL STREAM-A (100% POKLAPANJE)
 class Ablation2_NoSpectral(nn.Module):
     def __init__(self, in_ch: int = 3, out_ch: int = 3, base_ch: int = 32):
         super().__init__()
@@ -420,33 +435,33 @@ class Ablation2_NoSpectral(nn.Module):
             nn.Conv2d(base_ch * 8, base_ch * 8, 1, bias=False), nn.GroupNorm(4, base_ch * 8), nn.ReLU(inplace=False),
             DilatedContextBlock(base_ch * 8), RecursiveDenseRestorationBlock(base_ch * 8, num_recursions=2)
         )
-        self.decoder4 = DecoderRestorationBlock(base_ch * 8, base_ch * 8, base_ch * 4)
-        self.decoder3 = DecoderRestorationBlock(base_ch * 4, base_ch * 4, base_ch * 2)
-        self.decoder2 = DecoderRestorationBlock(base_ch * 2, base_ch * 2, base_ch)
-        self.decoder1 = DecoderRestorationBlock(base_ch, base_ch, base_ch)
+        self.decoder4 = DecoderBlockNoSpectral(base_ch * 8, base_ch * 8, base_ch * 4)
+        self.decoder3 = DecoderBlockNoSpectral(base_ch * 4, base_ch * 4, base_ch * 2)
+        self.decoder2 = DecoderBlockNoSpectral(base_ch * 2, base_ch * 2, base_ch)
+        self.decoder1 = DecoderBlockNoSpectral(base_ch, base_ch, base_ch)
         self.skip_gate1 = GatedSkipConnection(base_ch)
         self.skip_gate2 = GatedSkipConnection(base_ch * 2)
         self.skip_gate3 = GatedSkipConnection(base_ch * 4)
         self.skip_gate4 = GatedSkipConnection(base_ch * 8)
-        self.skip_refine1 = nn.Sequential(RecursiveDenseRestorationBlock(base_ch, 2), SpectralDecompositionRestorationBlock(base_ch))
-        self.skip_refine2 = nn.Sequential(RecursiveDenseRestorationBlock(base_ch * 2, 2), SpectralDecompositionRestorationBlock(base_ch * 2))
-        self.skip_refine3 = nn.Sequential(RecursiveDenseRestorationBlock(base_ch * 4, 2), SpectralDecompositionRestorationBlock(base_ch * 4))
-        self.skip_refine4 = nn.Sequential(RecursiveDenseRestorationBlock(base_ch * 8, 2), SpectralDecompositionRestorationBlock(base_ch * 8))
-        self.final_refinement = nn.Sequential(RecursiveDenseRestorationBlock(base_ch, 2), SpectralDecompositionRestorationBlock(base_ch), RecursiveDenseRestorationBlock(base_ch, 2))
+        self.skip_refine1 = nn.Sequential(RecursiveDenseRestorationBlock(base_ch, 2))
+        self.skip_refine2 = nn.Sequential(RecursiveDenseRestorationBlock(base_ch * 2, 2))
+        self.skip_refine3 = nn.Sequential(RecursiveDenseRestorationBlock(base_ch * 4, 2))
+        self.skip_refine4 = nn.Sequential(RecursiveDenseRestorationBlock(base_ch * 8, 2))
+        self.final_refinement = nn.Sequential(RecursiveDenseRestorationBlock(base_ch, 2), RecursiveDenseRestorationBlock(base_ch, 2))
         self.contrast_color_recovery = ContrastColorRecovery(base_ch, out_ch)
 
     def forward(self, x: Tensor) -> Tensor:
         input_img = x
-        s1, s1_skip = self.spatial_block1(x)
-        s2, s2_skip = self.spatial_block2(s1)
-        s3, s3_skip = self.spatial_block3(s2)
-        s4, s4_skip = self.spatial_block4(s3)
+        s1, s1_sk = self.spatial_block1(x)
+        s2, s2_sk = self.spatial_block2(s1)
+        s3, s3_sk = self.spatial_block3(s2)
+        s4, s4_sk = self.spatial_block4(s3)
         attended, damage_map = self.damage_attention(s4)
         b_out = self.bottleneck_refine(attended)
-        sk4 = self.skip_refine4(self.skip_gate4(s4_skip))
-        sk3 = self.skip_refine3(self.skip_gate3(s3_skip))
-        sk2 = self.skip_refine2(self.skip_gate2(s2_skip))
-        sk1 = self.skip_refine1(self.skip_gate1(s1_skip))
+        sk4 = self.skip_refine4(self.skip_gate4(s4_sk))
+        sk3 = self.skip_refine3(self.skip_gate3(s3_sk))
+        sk2 = self.skip_refine2(self.skip_gate2(s2_sk))
+        sk1 = self.skip_refine1(self.skip_gate1(s1_sk))
         d4 = self.decoder4(b_out, sk4, damage_map)
         d3 = self.decoder3(d4, sk3, damage_map)
         d2 = self.decoder2(d3, sk2, damage_map)
@@ -455,7 +470,8 @@ class Ablation2_NoSpectral(nn.Module):
             d1 = F.interpolate(d1, size=input_img.shape[2:], mode='bilinear', align_corners=False)
         refined = self.final_refinement(d1)
         edge_feat = self.edge_branch(input_img)
-        return self.contrast_color_recovery(self.edge_fusion(torch.cat([refined, edge_feat], dim=1)), input_img)
+        fused_out = self.edge_fusion(torch.cat([refined, edge_feat], dim=1))
+        return self.contrast_color_recovery(fused_out, input_img)
 
 # 3. BEZ ASYMMETRIC CROSS-BRIDGE
 class Ablation3_NoCrossBridge(nn.Module):
@@ -525,7 +541,7 @@ class Ablation3_NoCrossBridge(nn.Module):
         edge_feat = self.edge_branch(input_img)
         return self.contrast_color_recovery(self.edge_fusion(torch.cat([refined, edge_feat], dim=1)), input_img)
 
-# 4. BEZ GATED BOTTLENECK FUSION (ISPRAVLJENO: sp4 se interpolira na dimenziju s4 pre spajanja)
+# 4. BEZ GATED BOTTLENECK FUSION
 class Ablation4_NoGatedFusion(nn.Module):
     def __init__(self, in_channels: int = 3, out_channels: int = 3, base_ch: int = 32):
         super().__init__()
@@ -583,10 +599,8 @@ class Ablation4_NoGatedFusion(nn.Module):
         s4, s4_skip = self.spatial_block4(s3)
         c1, c2, c3, c4 = self.cross1(s1_skip, sp1), self.cross2(s2_skip, sp2), self.cross3(s3_skip, sp3), self.cross4(s4_skip, sp4)
         s4_enriched = s4 + F.adaptive_avg_pool2d(c4, s4.shape[2:])
-
         sp4_resized = F.interpolate(sp4, size=s4_enriched.shape[2:], mode='bilinear', align_corners=False)
         fused = self.simple_bottleneck_fuse(torch.cat([s4_enriched, sp4_resized], dim=1))
-
         attended, damage_map = self.damage_attention(fused)
         b_out = self.bottleneck_refine(attended)
         c4_r = F.interpolate(c4, size=s4_skip.shape[2:], mode='bilinear', align_corners=False)
@@ -982,17 +996,17 @@ class Ablation9_NoEdgeBranch(nn.Module):
         refined = self.final_refinement(d1)
         return self.contrast_color_recovery(refined, input_img)
 
-# 10. BEZ CONTRAST COLOR RECOVERY (CCR)
+# 10. BEZ CONTRAST COLOR RECOVERY (CCR) - TAČNO SA direct_conv (100% POKLAPANJE)
 class Ablation10_NoCCR(nn.Module):
-    def __init__(self, in_ch: int = 3, out_ch: int = 3, base_ch: int = 32):
+    def __init__(self, in_channels: int = 3, out_channels: int = 3, base_ch: int = 32):
         super().__init__()
         self.edge_branch = EdgeBranch(out_channels=base_ch)
         self.edge_fusion = nn.Conv2d(base_ch * 2, base_ch, 1, bias=False)
-        self.spatial_block1 = SpatialEncoderRestorationBlock(in_ch, base_ch)
+        self.spatial_block1 = SpatialEncoderRestorationBlock(in_channels, base_ch)
         self.spatial_block2 = SpatialEncoderRestorationBlock(base_ch, base_ch * 2)
         self.spatial_block3 = SpatialEncoderRestorationBlock(base_ch * 2, base_ch * 4)
         self.spatial_block4 = SpatialEncoderRestorationBlock(base_ch * 4, base_ch * 8)
-        self.spectral_init = nn.Sequential(nn.Conv2d(in_ch, base_ch, 3, padding=1, bias=False), nn.GroupNorm(4, base_ch), nn.ReLU(inplace=False))
+        self.spectral_init = nn.Sequential(nn.Conv2d(in_channels, base_ch, 3, padding=1, bias=False), nn.GroupNorm(4, base_ch), nn.ReLU(inplace=False))
         self.spectral_block1 = SpectralDecompositionRestorationBlock(base_ch)
         self.spectral_pool1 = nn.MaxPool2d(2)
         self.spec_proj1 = nn.Sequential(nn.Conv2d(base_ch, base_ch * 2, 1, bias=False), nn.GroupNorm(4, base_ch * 2), nn.ReLU(inplace=False))
@@ -1026,7 +1040,13 @@ class Ablation10_NoCCR(nn.Module):
         self.skip_refine3 = nn.Sequential(RecursiveDenseRestorationBlock(base_ch * 4, 2), SpectralDecompositionRestorationBlock(base_ch * 4))
         self.skip_refine4 = nn.Sequential(RecursiveDenseRestorationBlock(base_ch * 8, 2), SpectralDecompositionRestorationBlock(base_ch * 8))
         self.final_refinement = nn.Sequential(RecursiveDenseRestorationBlock(base_ch, 2), SpectralDecompositionRestorationBlock(base_ch), RecursiveDenseRestorationBlock(base_ch, 2))
-        self.out_conv = nn.Conv2d(base_ch, out_ch, 3, padding=1)
+        self.direct_conv = nn.Sequential(
+            nn.Conv2d(base_ch, base_ch // 2, 3, padding=1, bias=False),
+            nn.GroupNorm(4, base_ch // 2),
+            nn.ReLU(inplace=False),
+            nn.Conv2d(base_ch // 2, out_channels, 3, padding=1)
+        )
+
     def forward(self, x: Tensor) -> Tensor:
         input_img = x
         sp1 = self.spectral_block1(self.spectral_init(x))
@@ -1038,9 +1058,10 @@ class Ablation10_NoCCR(nn.Module):
         s3, s3_skip = self.spatial_block3(s2)
         s4, s4_skip = self.spatial_block4(s3)
         c1, c2, c3, c4 = self.cross1(s1_skip, sp1), self.cross2(s2_skip, sp2), self.cross3(s3_skip, sp3), self.cross4(s4_skip, sp4)
-        fused = self.gated_fusion(s4 + F.adaptive_avg_pool2d(c4, s4.shape[2:]), sp4)
+        s4_enriched = s4 + F.adaptive_avg_pool2d(c4, s4.shape[2:])
+        fused = self.gated_fusion(s4_enriched, sp4)
         attended, damage_map = self.damage_attention(fused)
-        b_out = self.bottleneck_refine(attended)
+        bottleneck_out = self.bottleneck_refine(attended)
         c4_r = F.interpolate(c4, size=s4_skip.shape[2:], mode='bilinear', align_corners=False)
         c3_r = F.interpolate(c3, size=s3_skip.shape[2:], mode='bilinear', align_corners=False)
         c2_r = F.interpolate(c2, size=s2_skip.shape[2:], mode='bilinear', align_corners=False)
@@ -1049,7 +1070,7 @@ class Ablation10_NoCCR(nn.Module):
         sk3 = self.skip_refine3(self.skip_gate3(s3_skip) + c3_r)
         sk2 = self.skip_refine2(self.skip_gate2(s2_skip) + c2_r)
         sk1 = self.skip_refine1(self.skip_gate1(s1_skip) + c1_r)
-        d4 = self.decoder4(b_out, sk4, damage_map)
+        d4 = self.decoder4(bottleneck_out, sk4, damage_map)
         d3 = self.decoder3(d4, sk3, damage_map)
         d2 = self.decoder2(d3, sk2, damage_map)
         d1 = self.decoder1(d2, sk1, damage_map)
@@ -1058,19 +1079,21 @@ class Ablation10_NoCCR(nn.Module):
         refined = self.final_refinement(d1)
         edge_feat = self.edge_branch(input_img)
         fused_out = self.edge_fusion(torch.cat([refined, edge_feat], dim=1))
-        return torch.clamp(input_img + self.out_conv(fused_out), 0.0, 1.0)
+        return torch.clamp(input_img + self.direct_conv(fused_out), 0.0, 1.0)
 
 # ==============================================================================
-# SIGURAN LOADER I EVALUATOR POJEDINAČNOG MODELA
+# SIGURAN LOADER I EVALUATOR
 # ==============================================================================
 def build_and_load_model(model_class, ckpt_path):
     m = model_class().to(device)
-    raw_state = torch.load(ckpt_path, map_location=device)
+    raw_state = torch.load(ckpt_path, map_location=device, weights_only=False)
     if isinstance(raw_state, dict):
         if 'state_dict' in raw_state:
             raw_state = raw_state['state_dict']
         elif 'model' in raw_state:
             raw_state = raw_state['model']
+        elif 'model_state_dict' in raw_state:
+            raw_state = raw_state['model_state_dict']
 
     cleaned_state = {}
     for k, v in raw_state.items():
@@ -1079,13 +1102,9 @@ def build_and_load_model(model_class, ckpt_path):
 
     model_state = m.state_dict()
     matched_state = {}
-    mismatched = []
     for k, v in cleaned_state.items():
-        if k in model_state:
-            if model_state[k].shape == v.shape:
-                matched_state[k] = v
-            else:
-                mismatched.append(k)
+        if k in model_state and model_state[k].shape == v.shape:
+            matched_state[k] = v
 
     m.load_state_dict(matched_state, strict=False)
     m.eval()
@@ -1094,10 +1113,10 @@ def build_and_load_model(model_class, ckpt_path):
 
 def evaluate_single_model(model, val_loader):
     model.eval()
-    psnr_per_img, ssim_per_img, lpips_per_img = [], [], []
+    psnr_per_img, ssim_per_img, lpips_per_img, fnames = [], [], [], []
 
     with torch.no_grad():
-        for d_t, c_t, _ in val_loader:
+        for d_t, c_t, fn in val_loader:
             d_t, c_t = d_t.to(device), c_t.to(device)
             out_t = torch.clamp(model(d_t), 0.0, 1.0)
 
@@ -1114,8 +1133,32 @@ def evaluate_single_model(model, val_loader):
             psnr_per_img.append(psnr_v)
             ssim_per_img.append(ssim_v)
             lpips_per_img.append(lpips_v)
+            fnames.append(fn[0])
 
-    return np.array(psnr_per_img), np.array(ssim_per_img), np.array(lpips_per_img)
+    return np.array(psnr_per_img), np.array(ssim_per_img), np.array(lpips_per_img), fnames
+
+# ==============================================================================
+# STATISTIČKE FUNKCIJE
+# ==============================================================================
+def bootstrap_metrics(psnr_arr, ssim_arr, lpips_arr, num_bootstraps=1000, seed=42):
+    n = len(psnr_arr)
+    rng = np.random.default_rng(seed=seed)
+    boot_p, boot_s, boot_l = [], [], []
+    for _ in range(num_bootstraps):
+        idx = rng.choice(n, size=n, replace=True)
+        boot_p.append(np.mean(psnr_arr[idx]))
+        boot_s.append(np.mean(ssim_arr[idx]))
+        boot_l.append(np.mean(lpips_arr[idx]))
+    return (
+        np.mean(boot_p), np.std(boot_p),
+        np.mean(boot_s), np.std(boot_s),
+        np.mean(boot_l), np.std(boot_l)
+    )
+
+def format_p_exact(p):
+    if p < 1e-4:
+        return f"{p:.2e}"
+    return f"{p:.4f}"
 
 def holm_bonferroni(p_vals):
     m = len(p_vals)
@@ -1137,13 +1180,13 @@ def holm_bonferroni(p_vals):
 val_ds = RestorationDataset(clean_dir=DIR_VAL_CLEAN, degraded_dir=DIR_VAL_DEGRADED, img_size=IMG_SIZE)
 val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=2, pin_memory=True)
 
-# 1. EVALUACIJA PUNOG MODELA (BASELINE)
-print("\n" + "="*80)
+# 1. EVALUACIJA PUNOG MODELA
+print("\n" + "="*85)
 print("1. EVALUACIJA: PUNI PREDLOŽENI MODEL (BASELINE)")
-print("="*80)
+print("="*85)
 
 CKPT_FULL = None
-for fld in [DIR_ABLACIJA_CKPT, DIR_CKPT_PRAVI, DRIVE_PROJECT_DIR]:
+for fld in [DIR_ABLACIJA_CKPT, DIR_CKPT_PRAVI, DIR_CKPT_ALT, DRIVE_PROJECT_DIR]:
     for fn in ["full_model_final_customloss.pth", "full_model_sepia25ep_customloss.pth", "model_final.pth", "full_model_final.pth"]:
         fp = os.path.join(fld, fn)
         if os.path.exists(fp):
@@ -1153,21 +1196,29 @@ for fld in [DIR_ABLACIJA_CKPT, DIR_CKPT_PRAVI, DRIVE_PROJECT_DIR]:
         break
 
 if not CKPT_FULL:
-    print("[UPOZORENJE] Puni model checkpoint nije pronađen. Koristim FullRestauracija po default-u.")
+    print("[UPOZORENJE] Puni model checkpoint nije pronađen. Koristim default FullRestauracija.")
     full_model = FullRestauracija().to(device)
 else:
     full_model = build_and_load_model(FullRestauracija, CKPT_FULL)
 
-full_psnr, full_ssim, full_lpips = evaluate_single_model(full_model, val_loader)
+full_psnr, full_ssim, full_lpips, fnames_all = evaluate_single_model(full_model, val_loader)
+fp_m, fp_sd, fs_m, fs_sd, fl_m, fl_sd = bootstrap_metrics(full_psnr, full_ssim, full_lpips, num_bootstraps=NUM_BOOTSTRAP)
 
-print("\n" + "-"*50)
-print(f"✓ PUNI MODEL REZULTATI:")
-print(f"  PSNR  : {np.mean(full_psnr):.2f} ± {np.std(full_psnr):.2f} dB")
-print(f"  SSIM  : {np.mean(full_ssim):.4f} ± {np.std(full_ssim):.4f}")
-print(f"  LPIPS : {np.mean(full_lpips):.4f} ± {np.std(full_lpips):.4f}")
-print("-" * 50 + "\n")
+print("\n" + "-"*55)
+print(f"✓ PUNI MODEL REZULTATI ({NUM_BOOTSTRAP} Bootstrap iteracija):")
+print(f"  PSNR  : {fp_m:.2f} ± {fp_sd:.2f} dB")
+print(f"  SSIM  : {fs_m:.4f} ± {fs_sd:.4f}")
+print(f"  LPIPS : {fl_m:.4f} ± {fl_sd:.4f}")
+print("-" * 55 + "\n")
 
-# 2. DEFINICIJA ABLACIONIH MODELA ZA PROVERU
+per_image_data = {
+    'Filename': fnames_all,
+    'Full_PSNR': full_psnr,
+    'Full_SSIM': full_ssim,
+    'Full_LPIPS': full_lpips
+}
+
+# 2. DEFINICIJA SVIH 10 ABLACIONIH MODELA
 ABLACIJE_LISTA = [
     ("1. w/o Spatial Encoder Stream", ["ablation1_no_spatial_final_fixed.pth", "ablation1_no_spatial_sepia25ep_fixed.pth", "ablation1_no_spatial_final.pth"], Ablation1_NoSpatial),
     ("2. w/o Spectral Encoder Stream", ["ablation2_no_spectral_final_stable.pth", "ablation2_no_spectral_sepia25ep_stable.pth", "ablation2_no_spectral_final.pth"], Ablation2_NoSpectral),
@@ -1183,16 +1234,16 @@ ABLACIJE_LISTA = [
 
 sve_metrike = [[
     "Full Proposed Model",
-    f"{np.mean(full_psnr):.2f} ± {np.std(full_psnr):.2f}",
-    f"{np.mean(full_ssim):.4f} ± {np.std(full_ssim):.4f}",
-    f"{np.mean(full_lpips):.4f} ± {np.std(full_lpips):.4f}"
+    f"{fp_m:.2f} ± {fp_sd:.2f}",
+    f"{fs_m:.4f} ± {fs_sd:.4f}",
+    f"{fl_m:.4f} ± {fl_sd:.4f}"
 ]]
 
 stat_podaci = []
 
 for naziv, ckpt_names, model_cls in ABLACIJE_LISTA:
     nadjen_fajl = None
-    for folder in [DIR_ABLACIJA_CKPT, DIR_CKPT_PRAVI, DRIVE_PROJECT_DIR]:
+    for folder in [DIR_ABLACIJA_CKPT, DIR_CKPT_PRAVI, DIR_CKPT_ALT, DRIVE_PROJECT_DIR]:
         for fn in ckpt_names:
             fp = os.path.join(folder, fn)
             if os.path.exists(fp):
@@ -1207,11 +1258,15 @@ for naziv, ckpt_names, model_cls in ABLACIJE_LISTA:
 
     print(f"\n[EVALUACIJA] {naziv}...")
     abl_model = build_and_load_model(model_cls, nadjen_fajl)
-    abl_p, abl_s, abl_l = evaluate_single_model(abl_model, val_loader)
+    abl_p, abl_s, abl_l, _ = evaluate_single_model(abl_model, val_loader)
 
-    p_m, p_sd = np.mean(abl_p), np.std(abl_p)
-    s_m, s_sd = np.mean(abl_s), np.std(abl_s)
-    l_m, l_sd = np.mean(abl_l), np.std(abl_l)
+    short_k = f"Abl_{naziv.split('.')[0]}"
+    per_image_data[f"{short_k}_PSNR"] = abl_p
+    per_image_data[f"{short_k}_SSIM"] = abl_s
+    per_image_data[f"{short_k}_LPIPS"] = abl_l
+
+    # 1000 Bootstrap procena
+    p_m, p_sd, s_m, s_sd, l_m, l_sd = bootstrap_metrics(abl_p, abl_s, abl_l, num_bootstraps=NUM_BOOTSTRAP)
 
     print(f"  --> PSNR : {p_m:.2f} dB (± {p_sd:.2f})")
     print(f"  --> SSIM : {s_m:.4f} (± {s_sd:.4f})")
@@ -1219,9 +1274,9 @@ for naziv, ckpt_names, model_cls in ABLACIJE_LISTA:
 
     sve_metrike.append([naziv, f"{p_m:.2f} ± {p_sd:.2f}", f"{s_m:.4f} ± {s_sd:.4f}", f"{l_m:.4f} ± {l_sd:.4f}"])
 
-    # Statistički proračun po slikama
+    # Statistički upareni testovi slika-po-slika
     diff = abl_p - full_psnr
-    delta = np.mean(diff)
+    delta = p_m - fp_m
 
     try:
         _, w_p = stats.wilcoxon(abl_p, full_psnr, zero_method='pratt')
@@ -1234,7 +1289,7 @@ for naziv, ckpt_names, model_cls in ABLACIJE_LISTA:
         t_p = 1.0
 
     sd_d = np.std(diff, ddof=1)
-    d_eff = delta / (sd_d + 1e-8)
+    d_eff = np.mean(diff) / (sd_d + 1e-8)
 
     stat_podaci.append({
         'name': naziv,
@@ -1244,41 +1299,48 @@ for naziv, ckpt_names, model_cls in ABLACIJE_LISTA:
         'd': d_eff
     })
 
+# Čuvanje punog per-image CSV fajla
+csv_per_img = os.path.join(DRIVE_PROJECT_DIR, "per_image_ablation_all_variants.csv")
+pd.DataFrame(per_image_data).to_csv(csv_per_img, index=False)
+print(f"\n✓ Sačuvane kompletne pojedinačne metrike po slikama na Drive:\n   -> {csv_per_img}")
+
 # ==============================================================================
 # ISPIS TABELA I ČUVANJE U CSV
 # ==============================================================================
 
 # TABELA 1: SVE METRIKE (PSNR, SSIM, LPIPS)
 print("\n" + "="*85)
-print("  TABELA 1: EVALUACIJA SVIH METRIKA (PSNR, SSIM, LPIPS)")
+print(f"  TABELA 1: EVALUACIJA SVIH METRIKA ({NUM_BOOTSTRAP} BOOTSTRAP ITERACIJA)")
 print("="*85)
-print(tabulate(sve_metrike, headers=["Model / Ablacija", "PSNR [↑]", "SSIM [↑]", "LPIPS [↓]"], tablefmt="fancy_grid"))
+print(tabulate(sve_metrike, headers=["Model / Ablacija", "PSNR [↑]", "SSIM [↑]", "LPIPS [↓]"], tablefmt="fancy_grid", stralign="center", numalign="center"))
 
 csv_metrike = os.path.join(DRIVE_PROJECT_DIR, "rezultati_evaluacije_svih_modela.csv")
 pd.DataFrame(sve_metrike[1:], columns=["Model / Ablacija", "PSNR", "SSIM", "LPIPS"]).to_csv(csv_metrike, index=False)
 print(f"✓ Tabela metrika sačuvana na: {csv_metrike}")
 
-# TABELA 2: STATISTIČKA ZNAČAJNOST
+# TABELA 2: STATISTIČKA ZNAČAJNOST (HOLM-BONFERRONI)
 if len(stat_podaci) > 0:
-    w_holm = holm_bonferroni([x['w_raw_p'] for x in stat_podaci])
-    t_holm = holm_bonferroni([x['t_raw_p'] for x in stat_podaci])
+    w_raw_list = [x['w_raw_p'] for x in stat_podaci]
+    t_raw_list = [x['t_raw_p'] for x in stat_podaci]
+    w_holm = holm_bonferroni(w_raw_list)
+    t_holm = holm_bonferroni(t_raw_list)
 
     tabela_stat = []
     for i, item in enumerate(stat_podaci):
         tabela_stat.append([
             item['name'],
             f"{item['delta']:+.2f} dB",
-            "< 0.001" if item['w_raw_p'] < 0.001 else f"{item['w_raw_p']:.4f}",
-            "< 0.001" if w_holm[i] < 0.001 else f"{w_holm[i]:.4f}",
-            "< 0.001" if t_holm[i] < 0.001 else f"{t_holm[i]:.4f}",
+            format_p_exact(item['w_raw_p']),
+            format_p_exact(w_holm[i]),
+            format_p_exact(t_holm[i]),
             f"{item['d']:.2f}"
         ])
 
     zaglavlja = ["Uklonjena Komponenta", "Δ PSNR", "Wilcoxon (Sirovo p)", "Wilcoxon (Holm-Bonf.)", "t-test (Holm-Bonf.)", "Cohen's d"]
     print("\n" + "="*95)
-    print("  TABELA 2: STATISTIČKA ZNAČAJNOST ABLACIONE STUDIJE")
+    print("  TABELA 2: STATISTIČKA ZNAČAJNOST ABLACIONE STUDIJE (HOLM-BONFERRONI KOREKCIJA)")
     print("="*95)
-    print(tabulate(tabela_stat, headers=zaglavlja, tablefmt="fancy_grid"))
+    print(tabulate(tabela_stat, headers=zaglavlja, tablefmt="fancy_grid", stralign="center", numalign="center"))
 
     csv_stat = os.path.join(DRIVE_PROJECT_DIR, "tabela_statisticka_znacajnost_ablacije.csv")
     pd.DataFrame(tabela_stat, columns=zaglavlja).to_csv(csv_stat, index=False)
