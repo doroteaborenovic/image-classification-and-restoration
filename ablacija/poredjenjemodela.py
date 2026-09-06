@@ -576,7 +576,7 @@ if len(postojece_ms_slike) >= len(val_files):
 else:
     print(f"\n-> Pokrećem ZVANIČNI Microsoft run.py pipeline (standard restoration bez --with_scratch) nad: {DIR_VAL_DEGRADED}...")
     gpu_flag = "0" if torch.cuda.is_available() else "-1"
-    
+
     # IZMENA: Uklonjen fleg --with_scratch radi usklađivanja sa Reviewer 2 nalazom N5
     cmd = f"cd {MS_REPO_DIR} && python run.py --input_folder {DIR_VAL_DEGRADED} --output_folder {DIR_BOPBL_TEMP_OUT} --GPU {gpu_flag}"
     subprocess.run(cmd, shell=True)
