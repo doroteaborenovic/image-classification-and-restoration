@@ -2,6 +2,7 @@
 # NAUČNO POREĐENJE: PREDLOŽENI MODEL vs PRAVI ZVANIČNI DDNM (ICLR 2023)
 # Zvanični OpenAI Guided Diffusion UNet Prior (256x256_diffusion_uncond.pt)
 # Prikaz: Čiste srednje vrednosti | Wilcoxon & t-test | Cohen's d | N = 160
+# (Folder za rezultate: rezultati_ddnm_zvanicni_v2 - sprečeno keširanje starog šuma)
 # ==============================================================================
 
 import os
@@ -59,11 +60,11 @@ try:
 except Exception:
     pass
 
-# Putanje do Google Drive-a
+# Putanje do Google Drive-a (Novi, čist folder za prave DDNM rezultate)
 DRIVE_PROJECT_DIR = '/content/drive/MyDrive/Projekat_Model'
 os.makedirs(DRIVE_PROJECT_DIR, exist_ok=True)
 DIR_ABLACIJA_DRIVE = os.path.join(DRIVE_PROJECT_DIR, 'ablacija_checkpoints')
-DIR_DDNM_DRIVE = os.path.join(DRIVE_PROJECT_DIR, 'rezultati_ddnm_zvanicni')
+DIR_DDNM_DRIVE = os.path.join(DRIVE_PROJECT_DIR, 'rezultati_ddnm_zvanicni_v2')
 os.makedirs(DIR_ABLACIJA_DRIVE, exist_ok=True)
 os.makedirs(DIR_DDNM_DRIVE, exist_ok=True)
 
@@ -106,7 +107,7 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 eval_lpips_fn = lpips.LPIPS(net='alex', verbose=False).to(device).eval()
 
 print(f"\n[INFO] Uređaj: {device}")
-print(f"[INFO] Trening skup: {len(os.listdir(DIR_TRAIN_DEGRADED))} slika | Validacioni skup dostupan u folderu: {len(os.listdir(DIR_VAL_DEGRADED))} slika\n")
+print(f"[INFO] Trening skup: {len(os.listdir(DIR_TRAIN_DEGRADED))} slika | Validacioni skup dostupan: {len(os.listdir(DIR_VAL_DEGRADED))} slika\n")
 
 
 # ==============================================================================
@@ -572,7 +573,6 @@ if not os.path.exists(DDNM_REPO_DIR):
 if DDNM_REPO_DIR not in sys.path:
     sys.path.insert(0, DDNM_REPO_DIR)
 
-# Preuzimanje zvaničnog OpenAI 256x256 Unconditional diffusion modela
 openai_ckpt_path = '/content/256x256_diffusion_uncond.pt'
 if not os.path.exists(openai_ckpt_path):
     print("-> Preuzimam zvanični OpenAI pretrained diffusion checkpoint (~550 MB)...")
@@ -669,6 +669,7 @@ def ddnm_official_sampling(unet_model, y_deg, num_steps=50, eta=0.85, sigma_y=0.
 # INFERENCIJA I RAČUNANJE METRIKA PO SLIKAMA (TAČNO 160 SLIKA)
 # ==============================================================================
 print(f"\n[INFO] Pokrećem autentično DDNM i Predloženi Model poređenje nad {len(val_files)} slika...")
+print(f"[INFO] DDNM rezultati se čuvaju u: {DIR_DDNM_DRIVE}")
 
 data_input = []
 data_moj = []
@@ -709,6 +710,7 @@ with torch.no_grad():
         if os.path.exists(ddnm_p):
             ddnm_img = cv2.resize(cv2.cvtColor(cv2.imread(ddnm_p), cv2.COLOR_BGR2RGB), (IMG_SIZE, IMG_SIZE)).astype(np.float32) / 255.0
         else:
+            # Izvršava pravi DDNM sampling nad slikom
             ddnm_out_t = ddnm_official_sampling(ddnm_unet, d_eval_t, num_steps=50, eta=0.85, sigma_y=0.05)
             ddnm_np = (ddnm_out_t.squeeze(0).cpu().numpy().transpose(1, 2, 0) * 255.0).round().astype(np.uint8).astype(np.float32) / 255.0
             cv2.imwrite(ddnm_p, cv2.cvtColor((ddnm_np * 255.0).astype(np.uint8), cv2.COLOR_RGB2BGR))
@@ -910,4 +912,4 @@ print(tabulate(tabela_poredjenje, headers=zaglavlja, tablefmt="fancy_grid", stra
 
 csv_izlaz = os.path.join(DRIVE_PROJECT_DIR, "tabela_ddnm_direktno_poredjenje_160slika.csv")
 pd.DataFrame(tabela_poredjenje, columns=zaglavlja).to_csv(csv_izlaz, index=False)
-print(f"\n✓ Tabela je uspešno sačuvana na Google Drive:\n   -> {csv_izlaz}\n") 
+print(f"\n✓ Tabela je uspešno sačuvana na Google Drive:\n   -> {csv_izlaz}\n")
