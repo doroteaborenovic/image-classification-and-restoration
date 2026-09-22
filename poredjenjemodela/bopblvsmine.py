@@ -1,14 +1,13 @@
 # ==============================================================================
-# NAUČNO POREĐENJE: PREDLOŽENI MODEL vs MICROSOFT BOPBL (N = 160)
-# (5 Nezavisnih Krugova x 1000 Bootstrap Iteracija = 5000 | Wilcoxon & t-test | Cohen's d)
-# Prikaz: Čiste srednje vrednosti (bez SD) + Kompletna statistička signifikantnost
+# NAUČNO POREĐENJE: PREDLOŽENI MODEL vs MICROSOFT BOPBL (N = 160 NEZAVISNIH SLIKA)
+# 1000 Bootstrap Iteracija | Upareni t-test & Wilcoxon signed-rank | Cohen's d_z
+# Prikaz: Čiste srednje vrednosti + Egzaktne razlike (Δ) + Statistički testovi
 # ==============================================================================
 
 import os
 import sys
 import copy
 import random
-import re
 import warnings
 import subprocess
 import shutil
@@ -70,8 +69,7 @@ EPOCHS_FINETUNE = 5
 BATCH_SIZE = 4
 LR_FINETUNE = 5e-5
 IMG_SIZE = 256
-NUM_RUNS = 5              # 5 nezavisnih krugova
-BOOTSTRAP_PO_KRUGU = 1000 # 1000 iteracija po krugu (Ukupno 5000 iteracija)
+BOOTSTRAP_ITERACIJA = 1000
 
 def pronadji_foldere(tip="VALIDACIJA"):
     moguce = [
@@ -163,7 +161,7 @@ class VGGPerceptualLoss(nn.Module):
 
 
 # ==============================================================================
-# ARHITEKTURA PREDLOŽENOG MODELA (SA TAČNIM PROJEKCIJAMA)
+# ARHITEKTURA PREDLOŽENOG MODELA
 # ==============================================================================
 class DepthwiseSeparableConv2d(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, kernel_size: int = 3, padding: int = 1, dilation: int = 1):
@@ -573,26 +571,34 @@ moj_model.eval()
 MS_REPO_DIR = '/content/Bringing-Old-Photos-Back-to-Life'
 DIR_BOPBL_TEMP_OUT = '/content/bopbl_temp_run'
 
-if not os.path.exists(MS_REPO_DIR):
-    devnull = subprocess.DEVNULL
-    print("\n-> Preuzimam zvanični Microsoft Bringing-Old-Photos-Back-to-Life repo...")
-    subprocess.run(f"git clone -q https://github.com/microsoft/Bringing-Old-Photos-Back-to-Life.git {MS_REPO_DIR}", shell=True, stdout=devnull, stderr=devnull)
+def check_bopbl_cache_complete(files, cache_dir):
+    if not os.path.exists(cache_dir):
+        return False
+    for f in files:
+        p1 = os.path.join(cache_dir, f)
+        p2 = os.path.join(cache_dir, f"{os.path.splitext(f)[0]}.png")
+        if not (os.path.exists(p1) or os.path.exists(p2)):
+            return False
+    return True
 
-    p1 = os.path.join(MS_REPO_DIR, 'Face_Enhancement/models/networks')
-    p2 = os.path.join(MS_REPO_DIR, 'Global/detection_models')
-    subprocess.run(f"cd {p1} && git clone -q https://github.com/vacancy/Synchronized-BatchNorm-PyTorch && cp -rf Synchronized-BatchNorm-PyTorch/sync_batchnorm .", shell=True, stdout=devnull, stderr=devnull)
-    subprocess.run(f"cd {p2} && git clone -q https://github.com/vacancy/Synchronized-BatchNorm-PyTorch && cp -rf Synchronized-BatchNorm-PyTorch/sync_batchnorm .", shell=True, stdout=devnull, stderr=devnull)
-
-    print("-> Preuzimam zvanične težine: Face & Global Checkpoints + Landmark model...")
-    subprocess.run(f"cd {MS_REPO_DIR}/Face_Detection && wget -q http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2 && bzip2 -d shape_predictor_68_face_landmarks.dat.bz2", shell=True, stdout=devnull, stderr=devnull)
-    subprocess.run(f"cd {MS_REPO_DIR}/Face_Enhancement && wget -q https://github.com/microsoft/Bringing-Old-Photos-Back-to-Life/releases/download/v1.0/face_checkpoints.zip && unzip -q face_checkpoints.zip", shell=True, stdout=devnull, stderr=devnull)
-    subprocess.run(f"cd {MS_REPO_DIR}/Global && wget -q https://github.com/microsoft/Bringing-Old-Photos-Back-to-Life/releases/download/v1.0/global_checkpoints.zip && unzip -q global_checkpoints.zip", shell=True, stdout=devnull, stderr=devnull)
-
-postojece_ms_slike = [f for f in os.listdir(DIR_NJIHOV_DRIVE) if f.lower().endswith(('.png', '.jpg', '.jpeg'))] if os.path.exists(DIR_NJIHOV_DRIVE) else []
-
-if len(postojece_ms_slike) >= len(val_files):
-    print(f"✓ [KEŠ] Koriste se postojeće generisane slike zvaničnog Microsoft modela sa Google Drive-a ({len(postojece_ms_slike)} slika).")
+if check_bopbl_cache_complete(val_files, DIR_NJIHOV_DRIVE):
+    print(f"✓ [KEŠ] Svi potrebni rezultati zvaničnog Microsoft modela postoje na Drive-u ({len(val_files)} slika).")
 else:
+    if not os.path.exists(MS_REPO_DIR):
+        devnull = subprocess.DEVNULL
+        print("\n-> Preuzimam zvanični Microsoft Bringing-Old-Photos-Back-to-Life repo...")
+        subprocess.run(f"git clone -q https://github.com/microsoft/Bringing-Old-Photos-Back-to-Life.git {MS_REPO_DIR}", shell=True, stdout=devnull, stderr=devnull)
+
+        p1 = os.path.join(MS_REPO_DIR, 'Face_Enhancement/models/networks')
+        p2 = os.path.join(MS_REPO_DIR, 'Global/detection_models')
+        subprocess.run(f"cd {p1} && git clone -q https://github.com/vacancy/Synchronized-BatchNorm-PyTorch && cp -rf Synchronized-BatchNorm-PyTorch/sync_batchnorm .", shell=True, stdout=devnull, stderr=devnull)
+        subprocess.run(f"cd {p2} && git clone -q https://github.com/vacancy/Synchronized-BatchNorm-PyTorch && cp -rf Synchronized-BatchNorm-PyTorch/sync_batchnorm .", shell=True, stdout=devnull, stderr=devnull)
+
+        print("-> Preuzimam zvanične težine: Face & Global Checkpoints + Landmark model...")
+        subprocess.run(f"cd {MS_REPO_DIR}/Face_Detection && wget -q http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2 && bzip2 -d shape_predictor_68_face_landmarks.dat.bz2", shell=True, stdout=devnull, stderr=devnull)
+        subprocess.run(f"cd {MS_REPO_DIR}/Face_Enhancement && wget -q https://github.com/microsoft/Bringing-Old-Photos-Back-to-Life/releases/download/v1.0/face_checkpoints.zip && unzip -q face_checkpoints.zip", shell=True, stdout=devnull, stderr=devnull)
+        subprocess.run(f"cd {MS_REPO_DIR}/Global && wget -q https://github.com/microsoft/Bringing-Old-Photos-Back-to-Life/releases/download/v1.0/global_checkpoints.zip && unzip -q global_checkpoints.zip", shell=True, stdout=devnull, stderr=devnull)
+
     print(f"\n-> Pokrećem ZVANIČNI Microsoft run.py pipeline nad: {DIR_VAL_DEGRADED} ({len(val_files)} slika)...")
     gpu_flag = "0" if torch.cuda.is_available() else "-1"
     cmd = f"cd {MS_REPO_DIR} && python run.py --input_folder {DIR_VAL_DEGRADED} --output_folder {DIR_BOPBL_TEMP_OUT} --GPU {gpu_flag}"
@@ -619,7 +625,7 @@ with torch.no_grad():
         c_p = os.path.join(DIR_VAL_CLEAN, fname)
         d_p = os.path.join(DIR_VAL_DEGRADED, fname)
         if not (os.path.exists(c_p) and os.path.exists(d_p)):
-            continue
+            raise FileNotFoundError(f"[GREŠKA] Nedostaje ulazna slika: {fname}")
 
         c_img = cv2.resize(cv2.cvtColor(cv2.imread(c_p), cv2.COLOR_BGR2RGB), (IMG_SIZE, IMG_SIZE)).astype(np.float32) / 255.0
         d_img = cv2.resize(cv2.cvtColor(cv2.imread(d_p), cv2.COLOR_BGR2RGB), (IMG_SIZE, IMG_SIZE)).astype(np.float32) / 255.0
@@ -649,11 +655,10 @@ with torch.no_grad():
         if not os.path.exists(ms_p):
             ms_p = os.path.join(DIR_NJIHOV_DRIVE, f"{os.path.splitext(fname)[0]}.png")
 
-        if os.path.exists(ms_p):
-            ms_img = cv2.resize(cv2.cvtColor(cv2.imread(ms_p), cv2.COLOR_BGR2RGB), (IMG_SIZE, IMG_SIZE)).astype(np.float32) / 255.0
-        else:
-            ms_img = d_img
+        if not os.path.exists(ms_p):
+            raise FileNotFoundError(f"[GREŠKA] Nedostaje BOPBL rezultat za sliku: {fname} u {DIR_NJIHOV_DRIVE}")
 
+        ms_img = cv2.resize(cv2.cvtColor(cv2.imread(ms_p), cv2.COLOR_BGR2RGB), (IMG_SIZE, IMG_SIZE)).astype(np.float32) / 255.0
         ms_eval_t = torch.from_numpy(ms_img).permute(2, 0, 1).unsqueeze(0).to(device) * 2.0 - 1.0
         psnr_ms = psnr_metric(c_img, ms_img, data_range=1.0)
         ssim_ms = ssim_metric(c_img, ms_img, channel_axis=2, data_range=1.0)
@@ -667,7 +672,6 @@ df_in = pd.DataFrame(data_input).set_index('Fname')
 df_moj = pd.DataFrame(data_moj).set_index('Fname')
 df_ms = pd.DataFrame(data_ms).set_index('Fname')
 
-# Osiguravanje identičnog redosleda indeksa
 df_moj = df_moj.reindex(df_in.index)
 df_ms = df_ms.reindex(df_in.index)
 
@@ -681,130 +685,72 @@ print(f"\n✓ Sačuvane per-image metrike: {os.path.join(DRIVE_PROJECT_DIR, 'per
 
 
 # ==============================================================================
-# STATISTIKA: 5 NEZAVISNIH KRUGOVA x 1000 BOOTSTRAP ITERACIJA (UKUPNO 5000)
+# NAUČNA STATISTIKA & PUNIH 1000 BOOTSTRAP ITERACIJA (N = 160)
 # ==============================================================================
-def get_scene_id(filename):
-    base = os.path.splitext(filename)[0]
-    match = re.match(r'^(scene_?\d+|img_?\d+|\d+)', base, re.IGNORECASE)
-    return match.group(1) if match else base.split('_')[0]
-
-scene_to_files = {}
-for f in val_files:
-    sid = get_scene_id(f)
-    scene_to_files.setdefault(sid, []).append(f)
-unique_scenes = np.array(list(scene_to_files.keys()))
-
-all_runs_in_p, all_runs_in_s, all_runs_in_l = [], [], []
-all_runs_moj_p, all_runs_moj_s, all_runs_moj_l = [], [], []
-all_runs_ms_p, all_runs_ms_s, all_runs_ms_l = [], [], []
-
-print(f"\n[INFO] Pokrećem {NUM_RUNS} nezavisnih krugova po {BOOTSTRAP_PO_KRUGU} bootstrap iteracija (Ukupno: {NUM_RUNS * BOOTSTRAP_PO_KRUGU} iteracija)...")
-
-for run_idx in range(NUM_RUNS):
-    cur_seed = SEED + run_idx * 100
-    run_in_p, run_in_s, run_in_l = [], [], []
-    run_moj_p, run_moj_s, run_moj_l = [], [], []
-    run_ms_p, run_ms_s, run_ms_l = [], [], []
-    
-    for it in range(BOOTSTRAP_PO_KRUGU):
-        rng = np.random.default_rng(seed=cur_seed + it)
-        sampled_scenes = rng.choice(unique_scenes, size=len(unique_scenes), replace=True)
-        boot_files = [f for s in sampled_scenes for f in scene_to_files[s] if f in df_moj.index]
-
-        run_in_p.append(df_in.loc[boot_files]['PSNR'].mean())
-        run_in_s.append(df_in.loc[boot_files]['SSIM'].mean())
-        run_in_l.append(df_in.loc[boot_files]['LPIPS'].mean())
-
-        run_moj_p.append(df_moj.loc[boot_files]['PSNR'].mean())
-        run_moj_s.append(df_moj.loc[boot_files]['SSIM'].mean())
-        run_moj_l.append(df_moj.loc[boot_files]['LPIPS'].mean())
-
-        run_ms_p.append(df_ms.loc[boot_files]['PSNR'].mean())
-        run_ms_s.append(df_ms.loc[boot_files]['SSIM'].mean())
-        run_ms_l.append(df_ms.loc[boot_files]['LPIPS'].mean())
-
-    all_runs_in_p.extend(run_in_p)
-    all_runs_in_s.extend(run_in_s)
-    all_runs_in_l.extend(run_in_l)
-
-    all_runs_moj_p.extend(run_moj_p)
-    all_runs_moj_s.extend(run_moj_s)
-    all_runs_moj_l.extend(run_moj_l)
-
-    all_runs_ms_p.extend(run_ms_p)
-    all_runs_ms_s.extend(run_ms_s)
-    all_runs_ms_l.extend(run_ms_l)
-
-    print(f"   ✓ Završen krug {run_idx+1}/{NUM_RUNS} (1000 iteracija)")
-
-
-# ==============================================================================
-# EGZAKTNA MATEMATIKA, PROSECI I METODOLOŠKI RIGOROZNI TESTOVI (N = 160)
-# ==============================================================================
-# 1. Determinističke i egzaktne srednje vrednosti na fiksiranom validacionom skupu
-# (Ovim je obezbeđeno da Ulaz bude 100% identičan u svakoj skripti i na svakom modelu)
-m_in_p = float(df_in['PSNR'].mean())
-m_in_s = float(df_in['SSIM'].mean())
-m_in_l = float(df_in['LPIPS'].mean())
-
-m_moj_p = float(df_moj['PSNR'].mean())
-m_moj_s = float(df_moj['SSIM'].mean())
-m_moj_l = float(df_moj['LPIPS'].mean())
-
-m_ms_p = float(df_ms['PSNR'].mean())
-m_ms_s = float(df_ms['SSIM'].mean())
-m_ms_l = float(df_ms['LPIPS'].mean())
-
-# 2. Zaokruživanje za tabelu i obično oduzimanje:
-# Predloženi - Ulaz i Predloženi - BOPBL (tačno do poslednje prikazane decimale)
-# PSNR se prikazuje na 2 decimale
-disp_in_p = round(m_in_p, 2)
-disp_moj_p = round(m_moj_p, 2)
-disp_ms_p = round(m_ms_p, 2)
-delta_in_p = disp_moj_p - disp_in_p
-delta_ms_p = disp_moj_p - disp_ms_p
-
-# SSIM se prikazuje na 4 decimale
-disp_in_s = round(m_in_s, 4)
-disp_moj_s = round(m_moj_s, 4)
-disp_ms_s = round(m_ms_s, 4)
-delta_in_s = disp_moj_s - disp_in_s
-delta_ms_s = disp_moj_s - disp_ms_s
-
-# LPIPS se prikazuje na 4 decimale
-disp_in_l = round(m_in_l, 4)
-disp_moj_l = round(m_moj_l, 4)
-disp_ms_l = round(m_ms_l, 4)
-delta_in_l = disp_moj_l - disp_in_l
-delta_ms_l = disp_moj_l - disp_ms_l
-
-# 3. Metodološki pretacni statistički testovi (Upareni uzorci, N = 160)
 val_moj_p, val_ms_p = df_moj['PSNR'].to_numpy(dtype=np.float64), df_ms['PSNR'].to_numpy(dtype=np.float64)
 val_moj_s, val_ms_s = df_moj['SSIM'].to_numpy(dtype=np.float64), df_ms['SSIM'].to_numpy(dtype=np.float64)
 val_moj_l, val_ms_l = df_moj['LPIPS'].to_numpy(dtype=np.float64), df_ms['LPIPS'].to_numpy(dtype=np.float64)
 
-# Wilcoxon signed-rank test (two-sided, standardna formula za uparene razlike)
-_, p_w_p = stats.wilcoxon(val_moj_p, val_ms_p, alternative='two-sided')
-_, p_w_s = stats.wilcoxon(val_moj_s, val_ms_s, alternative='two-sided')
-_, p_w_l = stats.wilcoxon(val_moj_l, val_ms_l, alternative='two-sided')
+# 1. Klasičan bootstrap od 1000 resamplovanja direktno nad 160 slika
+print(f"\n[INFO] Pokrećem {BOOTSTRAP_ITERACIJA} punih bootstrap resamplovanja nad 160 slika...")
+rng = np.random.default_rng(SEED)
+n_samples = len(val_moj_p)
 
-# Paired Student's t-test (two-sided, df = N - 1 = 159)
-t_stat_p, p_t_p = stats.ttest_rel(val_moj_p, val_ms_p)
-t_stat_s, p_t_s = stats.ttest_rel(val_moj_s, val_ms_s)
-t_stat_l, p_t_l = stats.ttest_rel(val_moj_l, val_ms_l)
+boot_moj_p, boot_ms_p = [], []
+boot_moj_s, boot_ms_s = [], []
+boot_moj_l, boot_ms_l = [], []
 
-# Cohen's d_z za uparene uzorke: mean(diff) / std(diff, ddof=1) == t / sqrt(N)
+for _ in range(BOOTSTRAP_ITERACIJA):
+    idx = rng.choice(n_samples, size=n_samples, replace=True)
+    boot_moj_p.append(np.mean(val_moj_p[idx]))
+    boot_ms_p.append(np.mean(val_ms_p[idx]))
+
+    boot_moj_s.append(np.mean(val_moj_s[idx]))
+    boot_ms_s.append(np.mean(val_ms_s[idx]))
+
+    boot_moj_l.append(np.mean(val_moj_l[idx]))
+    boot_ms_l.append(np.mean(val_ms_l[idx]))
+
+print(f"✓ Završeno svih {BOOTSTRAP_ITERACIJA} bootstrap iteracija.")
+
+# 2. Deterministički empirijski proseci (N = 160)
+disp_in_p = round(float(df_in['PSNR'].mean()), 2)
+disp_moj_p = round(float(df_moj['PSNR'].mean()), 2)
+disp_ms_p = round(float(df_ms['PSNR'].mean()), 2)
+delta_in_p = disp_moj_p - disp_in_p
+delta_ms_p = disp_moj_p - disp_ms_p
+
+disp_in_s = round(float(df_in['SSIM'].mean()), 4)
+disp_moj_s = round(float(df_moj['SSIM'].mean()), 4)
+disp_ms_s = round(float(df_ms['SSIM'].mean()), 4)
+delta_in_s = disp_moj_s - disp_in_s
+delta_ms_s = disp_moj_s - disp_ms_s
+
+disp_in_l = round(float(df_in['LPIPS'].mean()), 4)
+disp_moj_l = round(float(df_moj['LPIPS'].mean()), 4)
+disp_ms_l = round(float(df_ms['LPIPS'].mean()), 4)
+delta_in_l = disp_moj_l - disp_in_l
+delta_ms_l = disp_moj_l - disp_ms_l
+
+# 3. Upareni testovi signifikantnosti (Predloženi Model vs BOPBL, N = 160)
 diff_p = val_moj_p - val_ms_p
-std_diff_p = np.std(diff_p, ddof=1)
-d_psnr = float(np.mean(diff_p) / std_diff_p) if std_diff_p > 1e-12 else 0.0
-
 diff_s = val_moj_s - val_ms_s
-std_diff_s = np.std(diff_s, ddof=1)
-d_ssim = float(np.mean(diff_s) / std_diff_s) if std_diff_s > 1e-12 else 0.0
-
 diff_l = val_moj_l - val_ms_l
-std_diff_l = np.std(diff_l, ddof=1)
-d_lpips = float(np.mean(diff_l) / std_diff_l) if std_diff_l > 1e-12 else 0.0
+
+# Wilcoxon signed-rank test
+_, p_w_p = stats.wilcoxon(diff_p, alternative='two-sided')
+_, p_w_s = stats.wilcoxon(diff_s, alternative='two-sided')
+_, p_w_l = stats.wilcoxon(diff_l, alternative='two-sided')
+
+# Paired Student's t-test (ttest_rel)
+_, p_t_p = stats.ttest_rel(val_moj_p, val_ms_p)
+_, p_t_s = stats.ttest_rel(val_moj_s, val_ms_s)
+_, p_t_l = stats.ttest_rel(val_moj_l, val_ms_l)
+
+# Cohen's d_z za uparene uzorke
+d_psnr = float(np.mean(diff_p) / np.std(diff_p, ddof=1)) if np.std(diff_p, ddof=1) > 1e-12 else 0.0
+d_ssim = float(np.mean(diff_s) / np.std(diff_s, ddof=1)) if np.std(diff_s, ddof=1) > 1e-12 else 0.0
+d_lpips = float(np.mean(diff_l) / np.std(diff_l, ddof=1)) if np.std(diff_l, ddof=1) > 1e-12 else 0.0
 
 def format_p_exact(p):
     if p < 1e-4:
@@ -813,7 +759,7 @@ def format_p_exact(p):
 
 
 # ==============================================================================
-# FINALNA TABELA: ČISTI REZULTATI (BEZ STANDARDNE DEVIJACIJE)
+# FINALNA TABELA POREĐENJA (ČISTI REZULTATI I EGZAKTNE STATISTIKE)
 # ==============================================================================
 tabela_poredjenje = [
     [
