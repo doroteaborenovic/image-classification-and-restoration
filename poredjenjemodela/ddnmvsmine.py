@@ -1,15 +1,14 @@
 # ==============================================================================
 # NAUČNO POREĐENJE: PREDLOŽENI MODEL vs PRAVI ZVANIČNI DDNM (ICLR 2023)
 # Zvanični OpenAI Guided Diffusion UNet Prior (256x256_diffusion_uncond.pt)
-# Prikaz: Čiste srednje vrednosti | Wilcoxon & t-test | Cohen's d | N = 160
-# (Folder za rezultate: rezultati_ddnm_zvanicni_v2 - sprečeno keširanje starog šuma)
+# 1000 Bootstrap Iteracija | Upareni t-test & Wilcoxon signed-rank | Cohen's d_z
+# Prikaz: Čiste srednje vrednosti + Egzaktne razlike (Δ) + Statistički testovi
 # ==============================================================================
 
 import os
 import sys
 import copy
 import random
-import re
 import warnings
 import subprocess
 import shutil
@@ -60,7 +59,7 @@ try:
 except Exception:
     pass
 
-# Putanje do Google Drive-a (Novi, čist folder za prave DDNM rezultate)
+# Putanje do Google Drive-a
 DRIVE_PROJECT_DIR = '/content/drive/MyDrive/Projekat_Model'
 os.makedirs(DRIVE_PROJECT_DIR, exist_ok=True)
 DIR_ABLACIJA_DRIVE = os.path.join(DRIVE_PROJECT_DIR, 'ablacija_checkpoints')
@@ -73,7 +72,7 @@ EPOCHS_FINETUNE = 5
 BATCH_SIZE = 4
 LR_FINETUNE = 5e-5
 IMG_SIZE = 256
-NUM_ITERACIJA = 1000
+BOOTSTRAP_ITERACIJA = 1000
 
 def pronadji_foldere(tip="VALIDACIJA"):
     moguce = [
@@ -490,7 +489,7 @@ class Restauracija(nn.Module):
 
 
 # ==============================================================================
-# UČITAVANJE BAZNOG MODELA I 5-EPOHNA ADAPTACIJA
+# UČITAVANJE BAZNOG MODELA I ADAPTACIJA
 # ==============================================================================
 def ucitaj_state_dict_pametno(model, candidate_paths, device, strict=True):
     for p in candidate_paths:
@@ -585,7 +584,7 @@ ddnm_unet = UNetModel(
     image_size=256,
     in_channels=3,
     model_channels=256,
-    out_channels=6,  # 3 za mean + 3 za learned variance
+    out_channels=6,
     num_res_blocks=2,
     attention_resolutions=(8, 16, 32),
     dropout=0.0,
@@ -612,18 +611,12 @@ print("✓ [USPEH] Pravi difuzioni model je kompletno učitan u GPU memoriju!")
 # ZVANIČNI DDNM SAMPLER (POZIVA PRAVI UNET U SVAKOM KORAKU t)
 # ==============================================================================
 def ddnm_official_sampling(unet_model, y_deg, num_steps=50, eta=0.85, sigma_y=0.05):
-    """
-    Autentična DDNM sampling petlja iz rada:
-    U svakom koraku poziva eps_theta = unet_model(xt, t) i primenjuje
-    Null-Space projekciju: x0_t = x0_t + lambda_t * A_pinv(y - A(x0_t))
-    """
     total_timesteps = 1000
     betas = torch.linspace(1e-4, 0.02, total_timesteps, dtype=torch.float32, device=device)
     alphas = 1.0 - betas
     alphas_cumprod = torch.cumprod(alphas, dim=0)
 
     step_indices = torch.linspace(0, total_timesteps - 1, num_steps, dtype=torch.long, device=device)
-    
     xt = torch.randn_like(y_deg)
 
     for i in reversed(range(num_steps)):
@@ -632,7 +625,6 @@ def ddnm_official_sampling(unet_model, y_deg, num_steps=50, eta=0.85, sigma_y=0.
 
         at = alphas_cumprod[cur_t_idx]
         at_prev = alphas_cumprod[prev_t_idx] if prev_t_idx is not None else torch.tensor(1.0, device=device)
-
         t_tensor = torch.tensor([cur_t_idx], device=device).repeat(xt.shape[0])
 
         with torch.no_grad():
@@ -680,7 +672,7 @@ with torch.no_grad():
         c_p = os.path.join(DIR_VAL_CLEAN, fname)
         d_p = os.path.join(DIR_VAL_DEGRADED, fname)
         if not (os.path.exists(c_p) and os.path.exists(d_p)):
-            continue
+            raise FileNotFoundError(f"[GREŠKA] Nedostaje ulazna slika: {fname}")
 
         c_img = cv2.resize(cv2.cvtColor(cv2.imread(c_p), cv2.COLOR_BGR2RGB), (IMG_SIZE, IMG_SIZE)).astype(np.float32) / 255.0
         d_img = cv2.resize(cv2.cvtColor(cv2.imread(d_p), cv2.COLOR_BGR2RGB), (IMG_SIZE, IMG_SIZE)).astype(np.float32) / 255.0
@@ -710,7 +702,6 @@ with torch.no_grad():
         if os.path.exists(ddnm_p):
             ddnm_img = cv2.resize(cv2.cvtColor(cv2.imread(ddnm_p), cv2.COLOR_BGR2RGB), (IMG_SIZE, IMG_SIZE)).astype(np.float32) / 255.0
         else:
-            # Izvršava pravi DDNM sampling nad slikom
             ddnm_out_t = ddnm_official_sampling(ddnm_unet, d_eval_t, num_steps=50, eta=0.85, sigma_y=0.05)
             ddnm_np = (ddnm_out_t.squeeze(0).cpu().numpy().transpose(1, 2, 0) * 255.0).round().astype(np.uint8).astype(np.float32) / 255.0
             cv2.imwrite(ddnm_p, cv2.cvtColor((ddnm_np * 255.0).astype(np.uint8), cv2.COLOR_RGB2BGR))
@@ -729,11 +720,9 @@ df_in = pd.DataFrame(data_input).set_index('Fname')
 df_moj = pd.DataFrame(data_moj).set_index('Fname')
 df_ddnm = pd.DataFrame(data_ddnm).set_index('Fname')
 
-# Osiguravanje identičnog redosleda indeksa
 df_moj = df_moj.reindex(df_in.index)
 df_ddnm = df_ddnm.reindex(df_in.index)
 
-# Čuvanje per-image rezultata
 df_per_image_all = pd.DataFrame({
     'Input_PSNR': df_in['PSNR'], 'Input_SSIM': df_in['SSIM'], 'Input_LPIPS': df_in['LPIPS'],
     'Proposed_PSNR': df_moj['PSNR'], 'Proposed_SSIM': df_moj['SSIM'], 'Proposed_LPIPS': df_moj['LPIPS'],
@@ -744,109 +733,72 @@ print(f"\n✓ Sačuvane pojedinačne metrike: {os.path.join(DRIVE_PROJECT_DIR, '
 
 
 # ==============================================================================
-# NAUČNA STATISTIKA (1000 KLASTERISANIH BOOTSTRAP ITERACIJA | TESTOVI)
+# NAUČNA STATISTIKA & PUNIH 1000 BOOTSTRAP ITERACIJA (N = 160)
 # ==============================================================================
-def get_scene_id(filename):
-    base = os.path.splitext(filename)[0]
-    match = re.match(r'^(scene_?\d+|img_?\d+|\d+)', base, re.IGNORECASE)
-    return match.group(1) if match else base.split('_')[0]
-
-scene_to_files = {}
-for f in val_files:
-    sid = get_scene_id(f)
-    scene_to_files.setdefault(sid, []).append(f)
-unique_scenes = np.array(list(scene_to_files.keys()))
-
-iter_in_p, iter_in_s, iter_in_l = [], [], []
-iter_moj_p, iter_moj_s, iter_moj_l = [], [], []
-iter_ddnm_p, iter_ddnm_s, iter_ddnm_l = [], [], []
-
-print(f"\n[INFO] Pokrećem 1000 klasterisanih bootstrap iteracija po scenama...")
-for it in range(NUM_ITERACIJA):
-    rng = np.random.default_rng(seed=SEED + it)
-    sampled_scenes = rng.choice(unique_scenes, size=len(unique_scenes), replace=True)
-    boot_files = [f for s in sampled_scenes for f in scene_to_files[s] if f in df_moj.index]
-
-    iter_in_p.append(df_in.loc[boot_files]['PSNR'].mean())
-    iter_in_s.append(df_in.loc[boot_files]['SSIM'].mean())
-    iter_in_l.append(df_in.loc[boot_files]['LPIPS'].mean())
-
-    iter_moj_p.append(df_moj.loc[boot_files]['PSNR'].mean())
-    iter_moj_s.append(df_moj.loc[boot_files]['SSIM'].mean())
-    iter_moj_l.append(df_moj.loc[boot_files]['LPIPS'].mean())
-
-    iter_ddnm_p.append(df_ddnm.loc[boot_files]['PSNR'].mean())
-    iter_ddnm_s.append(df_ddnm.loc[boot_files]['SSIM'].mean())
-    iter_ddnm_l.append(df_ddnm.loc[boot_files]['LPIPS'].mean())
-
-
-# ==============================================================================
-# EGZAKTNA MATEMATIKA, PROSECI I METODOLOŠKI RIGOROZNI TESTOVI (N = 160)
-# ==============================================================================
-# 1. Determinističke empirijske srednje vrednosti nad identičnim validacionim skupom
-# (Garantuje 100% identične vrednosti za Ulaz i Predloženi Model kao u Microsoft BOPBL skripti)
-m_in_p = float(df_in['PSNR'].mean())
-m_in_s = float(df_in['SSIM'].mean())
-m_in_l = float(df_in['LPIPS'].mean())
-
-m_moj_p = float(df_moj['PSNR'].mean())
-m_moj_s = float(df_moj['SSIM'].mean())
-m_moj_l = float(df_moj['LPIPS'].mean())
-
-m_ddnm_p = float(df_ddnm['PSNR'].mean())
-m_ddnm_s = float(df_ddnm['SSIM'].mean())
-m_ddnm_l = float(df_ddnm['LPIPS'].mean())
-
-# 2. Zaokruživanje za tabelu i obično oduzimanje:
-# Predloženi - Ulaz i Predloženi - DDNM (tačno do poslednje prikazane decimale)
-# PSNR se prikazuje na 2 decimale
-disp_in_p = round(m_in_p, 2)
-disp_moj_p = round(m_moj_p, 2)
-disp_ddnm_p = round(m_ddnm_p, 2)
-delta_in_p = disp_moj_p - disp_in_p
-delta_ddnm_p = disp_moj_p - disp_ddnm_p
-
-# SSIM se prikazuje na 4 decimale
-disp_in_s = round(m_in_s, 4)
-disp_moj_s = round(m_moj_s, 4)
-disp_ddnm_s = round(m_ddnm_s, 4)
-delta_in_s = disp_moj_s - disp_in_s
-delta_ddnm_s = disp_moj_s - disp_ddnm_s
-
-# LPIPS se prikazuje na 4 decimale
-disp_in_l = round(m_in_l, 4)
-disp_moj_l = round(m_moj_l, 4)
-disp_ddnm_l = round(m_ddnm_l, 4)
-delta_in_l = disp_moj_l - disp_in_l
-delta_ddnm_l = disp_moj_l - disp_ddnm_l
-
-# 3. Metodološki pretacni statistički testovi (Upareni uzorci, N = 160)
 val_moj_p, val_ddnm_p = df_moj['PSNR'].to_numpy(dtype=np.float64), df_ddnm['PSNR'].to_numpy(dtype=np.float64)
 val_moj_s, val_ddnm_s = df_moj['SSIM'].to_numpy(dtype=np.float64), df_ddnm['SSIM'].to_numpy(dtype=np.float64)
 val_moj_l, val_ddnm_l = df_moj['LPIPS'].to_numpy(dtype=np.float64), df_ddnm['LPIPS'].to_numpy(dtype=np.float64)
 
-# Wilcoxon signed-rank test (two-sided, standardna formula za uparene razlike)
-_, p_w_p = stats.wilcoxon(val_moj_p, val_ddnm_p, alternative='two-sided')
-_, p_w_s = stats.wilcoxon(val_moj_s, val_ddnm_s, alternative='two-sided')
-_, p_w_l = stats.wilcoxon(val_moj_l, val_ddnm_l, alternative='two-sided')
+# 1. Klasičan bootstrap od 1000 resamplovanja direktno nad 160 slika
+print(f"\n[INFO] Pokrećem {BOOTSTRAP_ITERACIJA} punih bootstrap resamplovanja nad 160 slika...")
+rng = np.random.default_rng(SEED)
+n_samples = len(val_moj_p)
 
-# Paired Student's t-test (two-sided, df = N - 1 = 159)
-t_stat_p, p_t_p = stats.ttest_rel(val_moj_p, val_ddnm_p)
-t_stat_s, p_t_s = stats.ttest_rel(val_moj_s, val_ddnm_s)
-t_stat_l, p_t_l = stats.ttest_rel(val_moj_l, val_ddnm_l)
+boot_moj_p, boot_ddnm_p = [], []
+boot_moj_s, boot_ddnm_s = [], []
+boot_moj_l, boot_ddnm_l = [], []
 
-# Cohen's d_z za uparene uzorke: mean(diff) / std(diff, ddof=1) == t / sqrt(N)
+for _ in range(BOOTSTRAP_ITERACIJA):
+    idx = rng.choice(n_samples, size=n_samples, replace=True)
+    boot_moj_p.append(np.mean(val_moj_p[idx]))
+    boot_ddnm_p.append(np.mean(val_ddnm_p[idx]))
+
+    boot_moj_s.append(np.mean(val_moj_s[idx]))
+    boot_ddnm_s.append(np.mean(val_ddnm_s[idx]))
+
+    boot_moj_l.append(np.mean(val_moj_l[idx]))
+    boot_ddnm_l.append(np.mean(val_ddnm_l[idx]))
+
+print(f"✓ Završeno svih {BOOTSTRAP_ITERACIJA} bootstrap iteracija.")
+
+# 2. Deterministički empirijski proseci (N = 160)
+disp_in_p = round(float(df_in['PSNR'].mean()), 2)
+disp_moj_p = round(float(df_moj['PSNR'].mean()), 2)
+disp_ddnm_p = round(float(df_ddnm['PSNR'].mean()), 2)
+delta_in_p = disp_moj_p - disp_in_p
+delta_ddnm_p = disp_moj_p - disp_ddnm_p
+
+disp_in_s = round(float(df_in['SSIM'].mean()), 4)
+disp_moj_s = round(float(df_moj['SSIM'].mean()), 4)
+disp_ddnm_s = round(float(df_ddnm['SSIM'].mean()), 4)
+delta_in_s = disp_moj_s - disp_in_s
+delta_ddnm_s = disp_moj_s - disp_ddnm_s
+
+disp_in_l = round(float(df_in['LPIPS'].mean()), 4)
+disp_moj_l = round(float(df_moj['LPIPS'].mean()), 4)
+disp_ddnm_l = round(float(df_ddnm['LPIPS'].mean()), 4)
+delta_in_l = disp_moj_l - disp_in_l
+delta_ddnm_l = disp_moj_l - disp_ddnm_l
+
+# 3. Upareni testovi signifikantnosti (Predloženi Model vs DDNM, N = 160)
 diff_p = val_moj_p - val_ddnm_p
-std_diff_p = np.std(diff_p, ddof=1)
-d_psnr = float(np.mean(diff_p) / std_diff_p) if std_diff_p > 1e-12 else 0.0
-
 diff_s = val_moj_s - val_ddnm_s
-std_diff_s = np.std(diff_s, ddof=1)
-d_ssim = float(np.mean(diff_s) / std_diff_s) if std_diff_s > 1e-12 else 0.0
-
 diff_l = val_moj_l - val_ddnm_l
-std_diff_l = np.std(diff_l, ddof=1)
-d_lpips = float(np.mean(diff_l) / std_diff_l) if std_diff_l > 1e-12 else 0.0
+
+# Wilcoxon signed-rank test
+_, p_w_p = stats.wilcoxon(diff_p, alternative='two-sided')
+_, p_w_s = stats.wilcoxon(diff_s, alternative='two-sided')
+_, p_w_l = stats.wilcoxon(diff_l, alternative='two-sided')
+
+# Paired Student's t-test (ttest_rel)
+_, p_t_p = stats.ttest_rel(val_moj_p, val_ddnm_p)
+_, p_t_s = stats.ttest_rel(val_moj_s, val_ddnm_s)
+_, p_t_l = stats.ttest_rel(val_moj_l, val_ddnm_l)
+
+# Cohen's d_z za uparene uzorke
+d_psnr = float(np.mean(diff_p) / np.std(diff_p, ddof=1)) if np.std(diff_p, ddof=1) > 1e-12 else 0.0
+d_ssim = float(np.mean(diff_s) / np.std(diff_s, ddof=1)) if np.std(diff_s, ddof=1) > 1e-12 else 0.0
+d_lpips = float(np.mean(diff_l) / np.std(diff_l, ddof=1)) if np.std(diff_l, ddof=1) > 1e-12 else 0.0
 
 def format_p_exact(p):
     if p < 1e-4:
@@ -855,7 +807,7 @@ def format_p_exact(p):
 
 
 # ==============================================================================
-# FINALNA TABELA: ČISTI REZULTATI (HARMONIZOVANI SA MICROSOFT TABELOM)
+# FINALNA TABELA POREĐENJA (ČISTI REZULTATI I EGZAKTNE STATISTIKE)
 # ==============================================================================
 tabela_poredjenje = [
     [
